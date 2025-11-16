@@ -1,7 +1,7 @@
 package api
 
 import (
-	"client-dinas-pendidikan/internal"
+	"client-dinas-pendidikan/api/session"
 	"client-dinas-pendidikan/pkg/helpers"
 	"crypto/rand"
 	"crypto/sha256"
@@ -223,7 +223,7 @@ func SSOCallbackHandler(w http.ResponseWriter, r *http.Request) {
 				log.Printf("WARNING: Error finding/creating user: %v", err)
 			} else {
 				// Buat session di database client
-				sessionID, err := internal.CreateSession(userID, r)
+				sessionID, err := session.CreateSession(userID, r)
 				if err != nil {
 					log.Printf("WARNING: Error creating session: %v", err)
 				} else {

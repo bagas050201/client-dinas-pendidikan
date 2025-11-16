@@ -1,7 +1,7 @@
 package api
 
 import (
-	"client-dinas-pendidikan/internal"
+	"client-dinas-pendidikan/api/session"
 	"client-dinas-pendidikan/pkg/helpers"
 	"encoding/base64"
 	"encoding/json"
@@ -34,7 +34,7 @@ func InfoDinasHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validasi session
-	_, ok, err := internal.ValidateSession(sessionID)
+	_, ok, err := session.ValidateSession(sessionID)
 	if !ok || err != nil {
 		log.Printf("WARNING: Invalid session: %v, error: %v", ok, err)
 		helpers.ClearCookie(w, "client_dinas_session")

@@ -2,7 +2,7 @@ package api
 
 import (
 	"bytes"
-	"client-dinas-pendidikan/internal"
+	"client-dinas-pendidikan/api/session"
 	"client-dinas-pendidikan/pkg/helpers"
 	_ "embed"
 	"encoding/base64"
@@ -329,7 +329,7 @@ func LoginPostHandler(w http.ResponseWriter, r *http.Request) {
 	// Log untuk debugging
 	log.Printf("🔍 Creating session for userID: %v (type: %T)", userID, userID)
 
-	sessionID, err := internal.CreateSession(userID, r)
+	sessionID, err := session.CreateSession(userID, r)
 	if err != nil {
 		log.Printf("ERROR creating session: %v", err)
 		// Log error detail untuk debugging

@@ -1,7 +1,7 @@
 package api
 
 import (
-	"client-dinas-pendidikan/internal"
+	"client-dinas-pendidikan/api/session"
 	"client-dinas-pendidikan/pkg/helpers"
 	"log"
 	"net/http"
@@ -42,7 +42,7 @@ func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 			sessionID, err = helpers.GetCookie(r, "session_id")
 		}
 		if err == nil && sessionID != "" {
-			userID, ok, err := internal.ValidateSession(sessionID)
+			userID, ok, err := session.ValidateSession(sessionID)
 			if ok && err == nil && userID != "" {
 				// Session valid, lanjutkan
 				log.Printf("✅ Session valid for user: %s", userID)

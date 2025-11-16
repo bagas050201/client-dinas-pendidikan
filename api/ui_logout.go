@@ -1,7 +1,7 @@
 package api
 
 import (
-	"client-dinas-pendidikan/internal"
+	"client-dinas-pendidikan/api/session"
 	"client-dinas-pendidikan/pkg/helpers"
 	"log"
 	"net/http"
@@ -20,7 +20,7 @@ func LogoutHandler(w http.ResponseWriter, r *http.Request) {
 	sessionID, err := helpers.GetCookie(r, "client_dinas_session")
 	if err == nil && sessionID != "" {
 		// Revoke session di database (DELETE)
-		if err := internal.ClearSession(sessionID); err != nil {
+		if err := session.ClearSession(sessionID); err != nil {
 			log.Printf("WARNING: Error clearing session: %v", err)
 			// Lanjutkan meskipun error, tetap clear cookie
 		} else {

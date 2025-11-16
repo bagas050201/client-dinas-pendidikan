@@ -1,7 +1,7 @@
 package api
 
 import (
-	"client-dinas-pendidikan/internal"
+	"client-dinas-pendidikan/api/session"
 	"client-dinas-pendidikan/pkg/helpers"
 	"encoding/base64"
 	"encoding/json"
@@ -37,7 +37,7 @@ func renderDashboardWithToken(w http.ResponseWriter, r *http.Request) {
 
 	if err == nil && sessionID != "" {
 		// Validasi session jika ada
-		userID, ok, _ = internal.ValidateSession(sessionID)
+		userID, ok, _ = session.ValidateSession(sessionID)
 	}
 
 	// Ambil data user jika session ada
