@@ -51,16 +51,32 @@ func GenerateSessionID() (string, error) {
 }
 
 // SetCookie sets a secure HTTP cookie
-// Secure: false untuk development (localhost), true untuk production
-// Di production (Vercel), Secure akan di-handle oleh reverse proxy
-func SetCookie(w http.ResponseWriter, name, value string, maxAge int) {
+// Secure: false untuk development (localhost), true untuk production (HTTPS)
+// Auto-detect production berdasarkan request scheme (HTTPS) atau X-Forwarded-Proto header
+func SetCookie(w http.ResponseWriter, r *http.Request, name, value string, maxAge int) {
+	// Deteksi apakah request dari HTTPS (production)
+	// Vercel menggunakan X-Forwarded-Proto header
+	isSecure := false
+	if r != nil {
+		// Cek X-Forwarded-Proto header (Vercel/Cloudflare/proxy)
+		if proto := r.Header.Get("X-Forwarded-Proto"); proto == "https" {
+			isSecure = true
+		} else if r.TLS != nil {
+			// Cek langsung dari TLS connection
+			isSecure = true
+		} else if r.URL != nil && r.URL.Scheme == "https" {
+			// Cek dari URL scheme
+			isSecure = true
+		}
+	}
+
 	cookie := &http.Cookie{
 		Name:     name,
 		Value:    value,
 		Path:     "/",
 		MaxAge:   maxAge,
 		HttpOnly: true,
-		Secure:   false, // false untuk development (localhost), true untuk production
+		Secure:   isSecure,             // true untuk HTTPS (production), false untuk HTTP (development)
 		SameSite: http.SameSiteLaxMode, // Lax untuk compatibility yang lebih baik
 	}
 	http.SetCookie(w, cookie)
@@ -76,21 +92,31 @@ func GetCookie(r *http.Request, name string) (string, error) {
 }
 
 // ClearCookie removes a cookie
-func ClearCookie(w http.ResponseWriter, name string) {
+func ClearCookie(w http.ResponseWriter, r *http.Request, name string) {
+	// Deteksi apakah request dari HTTPS (production)
+	isSecure := false
+	if r != nil {
+		if proto := r.Header.Get("X-Forwarded-Proto"); proto == "https" {
+			isSecure = true
+		} else if r.TLS != nil {
+			isSecure = true
+		} else if r.URL != nil && r.URL.Scheme == "https" {
+			isSecure = true
+		}
+	}
+
 	// Clear cookie dengan MaxAge: -1 untuk menghapus cookie
-	// Gunakan Secure: false untuk development (localhost)
-	// Di production, Secure akan di-set ke true oleh reverse proxy (Vercel)
 	cookie := &http.Cookie{
 		Name:     name,
-		Value:   "",
+		Value:    "",
 		Path:     "/",
 		MaxAge:   -1, // Hapus cookie segera
 		HttpOnly: true,
-		Secure:   false, // false untuk development, true untuk production (akan di-handle oleh Vercel)
+		Secure:   isSecure,             // true untuk HTTPS (production), false untuk HTTP (development)
 		SameSite: http.SameSiteLaxMode, // Lax untuk compatibility yang lebih baik
 	}
 	http.SetCookie(w, cookie)
-	
+
 	// Juga set cookie dengan domain kosong untuk memastikan dihapus
 	cookie2 := &http.Cookie{
 		Name:     name,
@@ -98,7 +124,7 @@ func ClearCookie(w http.ResponseWriter, name string) {
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
-		Secure:   false,
+		Secure:   isSecure,
 		SameSite: http.SameSiteLaxMode,
 	}
 	http.SetCookie(w, cookie2)

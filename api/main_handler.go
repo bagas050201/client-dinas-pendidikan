@@ -434,7 +434,7 @@ func LoginPostHandler(w http.ResponseWriter, r *http.Request) {
 	// Set cookie dengan nama yang berbeda dari SSO server
 	// PENTING: Gunakan cookie name yang berbeda untuk mencegah shared cookie
 	// SSO server menggunakan "sso_admin_session", client website menggunakan "client_dinas_session"
-	helpers.SetCookie(w, "client_dinas_session", sessionID, 86400) // 24 jam
+	helpers.SetCookie(w, r, "client_dinas_session", sessionID, 86400) // 24 jam
 
 	// Log untuk debugging
 	log.Printf("✅ Login berhasil: %s, session: %s", req.Email, sessionID)
@@ -488,8 +488,8 @@ func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 			}
 			// Token expired atau invalid, clear cookies
 			log.Printf("WARNING: Access token expired or invalid, clearing cookies")
-			helpers.ClearCookie(w, "sso_access_token")
-			helpers.ClearCookie(w, "sso_token_expires")
+			helpers.ClearCookie(w, r, "sso_access_token")
+			helpers.ClearCookie(w, r, "sso_token_expires")
 		}
 
 		// Cek 2: Session dari direct login (fallback)
@@ -510,8 +510,8 @@ func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 			// Session invalid, clear cookie
 			if !ok {
 				log.Printf("WARNING: Session invalid, clearing cookie")
-				helpers.ClearCookie(w, "client_dinas_session")
-				helpers.ClearCookie(w, "session_id") // Clear juga untuk backward compatibility
+				helpers.ClearCookie(w, r, "client_dinas_session")
+				helpers.ClearCookie(w, r, "session_id") // Clear juga untuk backward compatibility
 			}
 		}
 
@@ -908,8 +908,8 @@ func InfoDinasHandler(w http.ResponseWriter, r *http.Request) {
 	_, ok, err := session.ValidateSession(sessionID)
 	if !ok || err != nil {
 		log.Printf("WARNING: Invalid session: %v, error: %v", ok, err)
-		helpers.ClearCookie(w, "client_dinas_session")
-		helpers.ClearCookie(w, "session_id") // Clear juga untuk backward compatibility
+		helpers.ClearCookie(w, r, "client_dinas_session")
+		helpers.ClearCookie(w, r, "session_id") // Clear juga untuk backward compatibility
 		http.Redirect(w, r, "/login?next=/info-dinas", http.StatusSeeOther)
 		return
 	}
@@ -1408,7 +1408,7 @@ func SSOAuthorizeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Simpan state di cookie untuk validasi saat callback
-	helpers.SetCookie(w, "sso_state", state, 600) // 10 menit
+	helpers.SetCookie(w, r, "sso_state", state, 600) // 10 menit
 
 	// Build authorize URL sesuai format SSO server
 	// Format: http://localhost:8080/apps/access?client_id=client-dinas-pendidikan
@@ -1437,6 +1437,8 @@ type UserInfo struct {
 	Email         string `json:"email"`
 	Name          string `json:"name"`
 	EmailVerified bool   `json:"email_verified"`
+	Peran         string `json:"peran"` // Peran dari SSO (admin, user, dll)
+	Role          string `json:"role"`  // Alternative field name untuk peran
 }
 
 // generateState menghasilkan random state untuk CSRF protection
@@ -1577,12 +1579,14 @@ func getUserInfoFromSSO(accessToken string, config SSOConfig) (*UserInfo, error)
 	log.Printf("   Email: %s", userInfo.Email)
 	log.Printf("   Name: %s", userInfo.Name)
 	log.Printf("   Sub: %s", userInfo.Sub)
+	log.Printf("   Peran: %s", userInfo.Peran)
+	log.Printf("   Role: %s", userInfo.Role)
 
-	// Jika Name kosong, coba parse dari response langsung (mungkin field berbeda)
-	if userInfo.Name == "" {
-		var rawResponse map[string]interface{}
-		if err := json.Unmarshal(bodyBytes, &rawResponse); err == nil {
-			// Coba berbagai field name yang mungkin
+	// Parse field tambahan dari raw response jika tidak ada di struct
+	var rawResponse map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &rawResponse); err == nil {
+		// Parse Name dari berbagai field yang mungkin
+		if userInfo.Name == "" {
 			if name, ok := rawResponse["nama_lengkap"].(string); ok && name != "" {
 				userInfo.Name = name
 				log.Printf("   ✅ Found name from 'nama_lengkap': %s", name)
@@ -1596,6 +1600,25 @@ func getUserInfoFromSSO(accessToken string, config SSOConfig) (*UserInfo, error)
 				log.Printf("   ⚠️  Name not found in response. Available fields: %v", getMapKeys(rawResponse))
 			}
 		}
+
+		// Parse Peran/Role dari berbagai field yang mungkin
+		if userInfo.Peran == "" && userInfo.Role == "" {
+			if peran, ok := rawResponse["peran"].(string); ok && peran != "" {
+				userInfo.Peran = peran
+				log.Printf("   ✅ Found peran from 'peran': %s", peran)
+			} else if role, ok := rawResponse["role"].(string); ok && role != "" {
+				userInfo.Peran = role
+				userInfo.Role = role
+				log.Printf("   ✅ Found peran from 'role': %s", role)
+			} else {
+				log.Printf("   ⚠️  Peran/Role not found in response. Available fields: %v", getMapKeys(rawResponse))
+			}
+		}
+	}
+
+	// Gunakan Role jika Peran kosong
+	if userInfo.Peran == "" && userInfo.Role != "" {
+		userInfo.Peran = userInfo.Role
 	}
 
 	return &userInfo, nil
@@ -1640,7 +1663,7 @@ func findOrCreateUser(userInfo *UserInfo) (interface{}, error) {
 		return nil, fmt.Errorf("gagal parse response: %v", err)
 	}
 
-	// Jika user sudah ada, update nama dari SSO jika berbeda
+	// Jika user sudah ada, update nama dan peran dari SSO jika berbeda
 	if len(users) > 0 {
 		existingUser := users[0]
 		userID := existingUser["id_pengguna"]
@@ -1649,17 +1672,35 @@ func findOrCreateUser(userInfo *UserInfo) (interface{}, error) {
 			userID = existingUser["id"]
 		}
 
-		// Update nama_lengkap dari SSO jika berbeda
+		// Cek apakah perlu update
 		existingName, _ := existingUser["nama_lengkap"].(string)
+		existingPeran, _ := existingUser["peran"].(string)
+		needsUpdate := false
+		updateData := map[string]interface{}{}
+
+		// Update nama_lengkap dari SSO jika berbeda
 		if userInfo.Name != "" && existingName != userInfo.Name {
+			updateData["nama_lengkap"] = userInfo.Name
+			needsUpdate = true
 			log.Printf("🔄 Updating user name from SSO: %s -> %s", existingName, userInfo.Name)
-			// Update nama di database
+		}
+
+		// Update peran dari SSO jika berbeda dan peran dari SSO tidak kosong
+		peranFromSSO := userInfo.Peran
+		if peranFromSSO == "" {
+			peranFromSSO = userInfo.Role
+		}
+		if peranFromSSO != "" && existingPeran != peranFromSSO {
+			updateData["peran"] = peranFromSSO
+			needsUpdate = true
+			log.Printf("🔄 Updating user peran from SSO: %s -> %s", existingPeran, peranFromSSO)
+		}
+
+		// Update di database jika ada perubahan
+		if needsUpdate {
 			userIDEncoded := url.QueryEscape(fmt.Sprintf("%v", userID))
 			updateURL := fmt.Sprintf("%s/rest/v1/pengguna?id_pengguna=eq.%s", supabaseURL, userIDEncoded)
 
-			updateData := map[string]interface{}{
-				"nama_lengkap": userInfo.Name,
-			}
 			updateJSON, _ := json.Marshal(updateData)
 
 			updateReq, err := http.NewRequest("PATCH", updateURL, strings.NewReader(string(updateJSON)))
@@ -1672,7 +1713,7 @@ func findOrCreateUser(userInfo *UserInfo) (interface{}, error) {
 				updateResp, err := http.DefaultClient.Do(updateReq)
 				if err == nil {
 					updateResp.Body.Close()
-					log.Printf("✅ User name updated: %s", userInfo.Name)
+					log.Printf("✅ User updated: %+v", updateData)
 				}
 			}
 		}
@@ -1681,11 +1722,23 @@ func findOrCreateUser(userInfo *UserInfo) (interface{}, error) {
 	}
 
 	// Jika user belum ada, buat baru
+	// Gunakan peran dari SSO, fallback ke "user" jika tidak ada
+	peran := userInfo.Peran
+	if peran == "" {
+		peran = userInfo.Role
+	}
+	if peran == "" {
+		peran = "user" // Default role jika tidak ada dari SSO
+		log.Printf("⚠️  Peran tidak ditemukan dari SSO, menggunakan default: user")
+	} else {
+		log.Printf("✅ Menggunakan peran dari SSO: %s", peran)
+	}
+
 	userData := map[string]interface{}{
 		"email":        userInfo.Email,
 		"nama_lengkap": userInfo.Name,
 		"aktif":        true,
-		"peran":        "user", // Default role
+		"peran":        peran,
 	}
 
 	userJSON, _ := json.Marshal(userData)
@@ -1792,7 +1845,7 @@ func SSOCallbackHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			// Clear state cookie setelah digunakan
-			helpers.ClearCookie(w, "sso_state")
+			helpers.ClearCookie(w, r, "sso_state")
 		}
 	}
 
@@ -1819,11 +1872,11 @@ func SSOCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	if tokenExpiresIn == 0 {
 		tokenExpiresIn = 3600 // Default 1 jam
 	}
-	helpers.SetCookie(w, "sso_access_token", tokenResponse.AccessToken, tokenExpiresIn)
+	helpers.SetCookie(w, r, "sso_access_token", tokenResponse.AccessToken, tokenExpiresIn)
 
 	// Simpan token expires timestamp (current time + expires_in)
 	tokenExpiresAt := time.Now().Unix() + int64(tokenExpiresIn)
-	helpers.SetCookie(w, "sso_token_expires", fmt.Sprintf("%d", tokenExpiresAt), tokenExpiresIn)
+	helpers.SetCookie(w, r, "sso_token_expires", fmt.Sprintf("%d", tokenExpiresAt), tokenExpiresIn)
 
 	log.Printf("✅ Token saved: expires in %d seconds", tokenExpiresIn)
 
@@ -1850,7 +1903,7 @@ func SSOCallbackHandler(w http.ResponseWriter, r *http.Request) {
 					// Set cookie session dengan nama yang berbeda dari SSO server
 					// PENTING: Gunakan cookie name yang berbeda untuk mencegah shared cookie
 					// SSO server menggunakan "sso_admin_session", client website menggunakan "client_dinas_session"
-					helpers.SetCookie(w, "client_dinas_session", sessionID, 86400) // 24 jam
+					helpers.SetCookie(w, r, "client_dinas_session", sessionID, 86400) // 24 jam
 					log.Printf("✅ User session created: %s, session: %s", userEmail, sessionID)
 				}
 			}
@@ -1885,8 +1938,8 @@ func ProfileHandler(w http.ResponseWriter, r *http.Request) {
 	userID, ok, err := session.ValidateSession(sessionID)
 	if !ok || err != nil {
 		log.Printf("WARNING: Invalid session: %v, error: %v", ok, err)
-		helpers.ClearCookie(w, "client_dinas_session")
-		helpers.ClearCookie(w, "session_id") // Clear juga untuk backward compatibility
+		helpers.ClearCookie(w, r, "client_dinas_session")
+		helpers.ClearCookie(w, r, "session_id") // Clear juga untuk backward compatibility
 		http.Redirect(w, r, "/login?next=/profile", http.StatusSeeOther)
 		return
 	}
@@ -2209,14 +2262,14 @@ func LogoutHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Clear SEMUA cookie terkait auth client website
 	// PENTING: Hanya hapus cookie client website, TIDAK hapus cookie SSO server
-	helpers.ClearCookie(w, "client_dinas_session") // Session dari client website
-	helpers.ClearCookie(w, "sso_access_token")     // Access token dari SSO (OAuth 2.0)
-	helpers.ClearCookie(w, "sso_token_expires")    // Token expiration
-	helpers.ClearCookie(w, "sso_state")            // State untuk CSRF protection
-	helpers.ClearCookie(w, "sso_code_verifier")    // PKCE verifier (jika ada)
+	helpers.ClearCookie(w, r, "client_dinas_session") // Session dari client website
+	helpers.ClearCookie(w, r, "sso_access_token")     // Access token dari SSO (OAuth 2.0)
+	helpers.ClearCookie(w, r, "sso_token_expires")    // Token expiration
+	helpers.ClearCookie(w, r, "sso_state")            // State untuk CSRF protection
+	helpers.ClearCookie(w, r, "sso_code_verifier")    // PKCE verifier (jika ada)
 
 	// Clear cookie lama untuk backward compatibility
-	helpers.ClearCookie(w, "session_id")
+	helpers.ClearCookie(w, r, "session_id")
 	// PENTING: Jangan clear sso_admin_session karena itu cookie dari SSO server
 	// Logout di client website tidak seharusnya logout dari SSO server (OAuth 2.0 standard)
 
@@ -2590,7 +2643,7 @@ func handleSSOTokenWithCookie(w http.ResponseWriter, r *http.Request, token stri
 	}
 
 	// Set cookie
-	helpers.SetCookie(w, "session_id", sessionID, 86400)
+	helpers.SetCookie(w, r, "session_id", sessionID, 86400)
 	return true
 }
 
@@ -2604,7 +2657,7 @@ func handleSSOTokenSimpleWithCookie(w http.ResponseWriter, r *http.Request, toke
 		if helpers.ValidateEmail(email) {
 			sessionID, ok := createSessionFromEmail(r, email)
 			if ok {
-				helpers.SetCookie(w, "session_id", sessionID, 86400)
+				helpers.SetCookie(w, r, "session_id", sessionID, 86400)
 				return true
 			}
 		}
@@ -2614,7 +2667,7 @@ func handleSSOTokenSimpleWithCookie(w http.ResponseWriter, r *http.Request, toke
 	if helpers.ValidateEmail(token) {
 		sessionID, ok := createSessionFromEmail(r, token)
 		if ok {
-			helpers.SetCookie(w, "session_id", sessionID, 86400)
+			helpers.SetCookie(w, r, "session_id", sessionID, 86400)
 			return true
 		}
 	}
@@ -2694,7 +2747,7 @@ func handleSSOSessionWithCookie(w http.ResponseWriter, r *http.Request, session 
 	}
 
 	// Set cookie
-	helpers.SetCookie(w, "session_id", sessionID, 86400)
+	helpers.SetCookie(w, r, "session_id", sessionID, 86400)
 	return true
 }
 
@@ -2954,7 +3007,7 @@ func handleLoginAPI(w http.ResponseWriter, r *http.Request) {
 	resp.Body.Close()
 
 	// Set cookie
-	helpers.SetCookie(w, "session_id", sessionID, 86400)
+	helpers.SetCookie(w, r, "session_id", sessionID, 86400)
 
 	// Return success with redirect instruction
 	helpers.WriteJSON(w, http.StatusOK, map[string]interface{}{
@@ -3132,7 +3185,7 @@ func handleRegisterAPI(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// Set cookie dengan nama yang berbeda dari SSO server
 		// PENTING: Gunakan cookie name yang berbeda untuk mencegah shared cookie
-		helpers.SetCookie(w, "client_dinas_session", sessionID, 86400) // 24 jam
+		helpers.SetCookie(w, r, "client_dinas_session", sessionID, 86400) // 24 jam
 		log.Printf("✅ Session created for new user: %s", sessionID)
 	}
 
@@ -3156,7 +3209,7 @@ func handleLogoutAPI(w http.ResponseWriter, r *http.Request) {
 		http.DefaultClient.Do(httpReq)
 	}
 
-	helpers.ClearCookie(w, "session_id")
+	helpers.ClearCookie(w, r, "session_id")
 	helpers.WriteSuccess(w, "Logout berhasil", nil)
 }
 
@@ -3170,7 +3223,7 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 		http.DefaultClient.Do(httpReq)
 	}
 
-	helpers.ClearCookie(w, "session_id")
+	helpers.ClearCookie(w, r, "session_id")
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
