@@ -1,0 +1,19 @@
+# Exclude test files
+**/*_test.go
+tests/
+test/
+
+# Exclude non-deployment files
+*.md
+*.sh
+.env
+.env.local
+go.sum
+
+# Exclude individual handler files (only main_handler.go is used)
+api/*.go
+!api/main_handler.go
+
+# Development files
+dev.go
+
