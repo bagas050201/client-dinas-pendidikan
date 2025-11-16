@@ -2,7 +2,6 @@ package api
 
 import (
 	"bytes"
-	"client-dinas-pendidikan/internal"
 	"client-dinas-pendidikan/pkg/helpers"
 	_ "embed"
 	"encoding/base64"
@@ -747,7 +746,7 @@ func getCurrentUser(r *http.Request) (map[string]interface{}, error) {
 	}
 
 	// Validasi session dan ambil user ID (sama seperti dashboard)
-	userID, ok, err := internal.ValidateSession(sessionID)
+	userID, ok, err := validateSession(sessionID)
 	if !ok || err != nil || userID == "" {
 		return nil, fmt.Errorf("session tidak valid")
 	}
@@ -1355,6 +1354,180 @@ func getIPAddress(r *http.Request) string {
 		ip = r.RemoteAddr
 	}
 	return strings.Split(ip, ",")[0]
+}
+
+// Session Management Functions (moved from internal/session_helper.go for Vercel compatibility)
+
+// createSession membuat session baru di database dan mengembalikan session ID
+func createSession(userID interface{}, r *http.Request) (sessionID string, err error) {
+	supabaseURL := getSupabaseURL()
+	supabaseKey := getSupabaseKey()
+	if supabaseURL == "" || supabaseKey == "" {
+		return "", fmt.Errorf("SUPABASE_URL atau SUPABASE_KEY tidak di-set")
+	}
+
+	// Generate session ID
+	sessionID, err = helpers.GenerateSessionID()
+	if err != nil {
+		log.Printf("ERROR generating session ID: %v", err)
+		return "", fmt.Errorf("gagal membuat session ID")
+	}
+
+	// Siapkan data session sesuai schema Supabase
+	expiresAt := time.Now().Add(24 * time.Hour)
+	sessionData := map[string]interface{}{
+		"id_pengguna": userID,
+		"id_sesi":     sessionID,
+		"ip":          getIPAddress(r),
+		"user_agent":  r.UserAgent(),
+		"kadaluarsa":  expiresAt.Format(time.RFC3339),
+	}
+
+	// Convert ke JSON
+	sessionJSON, err := json.Marshal(sessionData)
+	if err != nil {
+		log.Printf("ERROR marshaling session data: %v", err)
+		return "", fmt.Errorf("gagal memproses data session")
+	}
+
+	// POST ke Supabase
+	apiURL := fmt.Sprintf("%s/rest/v1/sesi_login", supabaseURL)
+	httpReq, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(sessionJSON))
+	if err != nil {
+		log.Printf("ERROR creating request: %v", err)
+		return "", fmt.Errorf("gagal membuat request")
+	}
+
+	httpReq.Header.Set("apikey", supabaseKey)
+	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Prefer", "return=representation")
+
+	// Eksekusi request
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		log.Printf("ERROR calling Supabase: %v", err)
+		return "", fmt.Errorf("gagal terhubung ke database")
+	}
+	defer resp.Body.Close()
+
+	// Baca response untuk debugging
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		log.Printf("ERROR Supabase response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
+		return "", fmt.Errorf("gagal membuat session di database: status %d", resp.StatusCode)
+	}
+
+	log.Printf("✅ Session created: %s for user: %v", sessionID, userID)
+	return sessionID, nil
+}
+
+// validateSession memvalidasi session ID dan mengembalikan user ID jika valid
+func validateSession(sessionID string) (userID string, ok bool, err error) {
+	supabaseURL := getSupabaseURL()
+	supabaseKey := getSupabaseKey()
+	if supabaseURL == "" || supabaseKey == "" {
+		return "", false, fmt.Errorf("SUPABASE_URL atau SUPABASE_KEY tidak di-set")
+	}
+
+	if sessionID == "" {
+		return "", false, fmt.Errorf("session ID kosong")
+	}
+
+	// Query session dengan proper URL encoding
+	sessionIDEncoded := url.QueryEscape(sessionID)
+	now := time.Now().Format(time.RFC3339)
+	nowEncoded := url.QueryEscape(now)
+
+	// Query: id_sesi = ? AND kadaluarsa > now
+	apiURL := fmt.Sprintf("%s/rest/v1/sesi_login?id_sesi=eq.%s&kadaluarsa=gt.%s&select=id_pengguna",
+		supabaseURL, sessionIDEncoded, nowEncoded)
+
+	httpReq, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		log.Printf("ERROR creating request: %v", err)
+		return "", false, fmt.Errorf("gagal membuat request")
+	}
+
+	httpReq.Header.Set("apikey", supabaseKey)
+	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		log.Printf("ERROR calling Supabase: %v", err)
+		return "", false, fmt.Errorf("gagal terhubung ke database")
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("ERROR Supabase response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
+		return "", false, fmt.Errorf("gagal memvalidasi session")
+	}
+
+	var sessions []map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &sessions); err != nil {
+		log.Printf("ERROR parsing response: %v", err)
+		return "", false, fmt.Errorf("gagal memproses data")
+	}
+
+	if len(sessions) == 0 {
+		return "", false, nil // Session tidak ditemukan atau expired
+	}
+
+	// Extract id_pengguna (user_id)
+	session := sessions[0]
+	userIDVal := session["id_pengguna"]
+	if userIDVal == nil {
+		return "", false, fmt.Errorf("id_pengguna tidak ditemukan")
+	}
+
+	// Convert id_pengguna ke string
+	userID = fmt.Sprintf("%v", userIDVal)
+	return userID, true, nil
+}
+
+// clearSession menghapus session di database (DELETE)
+func clearSession(sessionID string) error {
+	supabaseURL := getSupabaseURL()
+	supabaseKey := getSupabaseKey()
+	if supabaseURL == "" || supabaseKey == "" {
+		return fmt.Errorf("SUPABASE_URL atau SUPABASE_KEY tidak di-set")
+	}
+
+	if sessionID == "" {
+		return fmt.Errorf("session ID kosong")
+	}
+
+	// DELETE session dari Supabase
+	sessionIDEncoded := url.QueryEscape(sessionID)
+	apiURL := fmt.Sprintf("%s/rest/v1/sesi_login?id_sesi=eq.%s", supabaseURL, sessionIDEncoded)
+	httpReq, err := http.NewRequest("DELETE", apiURL, nil)
+	if err != nil {
+		log.Printf("ERROR creating request: %v", err)
+		return fmt.Errorf("gagal membuat request")
+	}
+
+	httpReq.Header.Set("apikey", supabaseKey)
+	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		log.Printf("ERROR calling Supabase: %v", err)
+		return fmt.Errorf("gagal terhubung ke database")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		log.Printf("ERROR Supabase response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
+		return fmt.Errorf("gagal menghapus session")
+	}
+
+	log.Printf("✅ Session cleared: %s", sessionID)
+	return nil
 }
 
 // Page rendering functions
@@ -2008,7 +2181,7 @@ func renderHomePage(w http.ResponseWriter, r *http.Request) {
 	var user map[string]interface{}
 	if err == nil && sessionID != "" {
 		// Validasi session dan ambil user ID
-		userID, ok, err := internal.ValidateSession(sessionID)
+		userID, ok, err := validateSession(sessionID)
 		if ok && err == nil && userID != "" {
 			// Ambil data user dari database (sama seperti dashboard)
 			user, err = getUserByIDForHome(userID)
