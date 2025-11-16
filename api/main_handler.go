@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"client-dinas-pendidikan/api/session"
 	"client-dinas-pendidikan/pkg/helpers"
+	"crypto/rand"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -464,6 +465,1765 @@ func LoginPostHandler(w http.ResponseWriter, r *http.Request) {
 	// PENTING: Redirect dengan status 303 (See Other) untuk POST request
 	// Jangan tulis response body sebelum redirect
 	http.Redirect(w, r, next, http.StatusSeeOther)
+}
+
+// RequireAuth adalah middleware untuk protect routes
+// Cek apakah user memiliki access token ATAU session yang valid
+// Support kedua metode: SSO (access token) dan direct login (session)
+func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Cek 1: Access token dari SSO (prioritas pertama)
+		accessToken, err := helpers.GetCookie(r, "sso_access_token")
+		if err == nil && accessToken != "" {
+			// Cek token expiration
+			tokenExpiresStr, err := helpers.GetCookie(r, "sso_token_expires")
+			if err == nil && tokenExpiresStr != "" {
+				tokenExpires, err := strconv.ParseInt(tokenExpiresStr, 10, 64)
+				if err == nil && time.Now().Unix() <= tokenExpires {
+					// Access token valid, lanjutkan
+					log.Printf("✅ Access token valid")
+					next(w, r)
+					return
+				}
+			}
+			// Token expired atau invalid, clear cookies
+			log.Printf("WARNING: Access token expired or invalid, clearing cookies")
+			helpers.ClearCookie(w, "sso_access_token")
+			helpers.ClearCookie(w, "sso_token_expires")
+		}
+
+		// Cek 2: Session dari direct login (fallback)
+		// PENTING: Hanya gunakan cookie client_dinas_session, JANGAN gunakan sso_admin_session dari SSO server
+		sessionID, err := helpers.GetCookie(r, "client_dinas_session")
+		if err != nil {
+			// Fallback ke session_id untuk backward compatibility (cookie lama dari direct login)
+			sessionID, err = helpers.GetCookie(r, "session_id")
+		}
+		if err == nil && sessionID != "" {
+			userID, ok, err := session.ValidateSession(sessionID)
+			if ok && err == nil && userID != "" {
+				// Session valid, lanjutkan
+				log.Printf("✅ Session valid for user: %s", userID)
+				next(w, r)
+				return
+			}
+			// Session invalid, clear cookie
+			if !ok {
+				log.Printf("WARNING: Session invalid, clearing cookie")
+				helpers.ClearCookie(w, "client_dinas_session")
+				helpers.ClearCookie(w, "session_id") // Clear juga untuk backward compatibility
+			}
+		}
+
+		// Tidak ada token atau session yang valid, redirect ke login
+		// JANGAN tambahkan error=no_token untuk menghindari redirect loop
+		// Jika sudah ada error di URL, jangan tambahkan lagi
+		nextParam := r.URL.Query().Get("next")
+		if nextParam == "" {
+			nextParam = r.URL.Path
+		}
+		redirectURL := "/login"
+		if nextParam != "" && nextParam != "/login" {
+			redirectURL = "/login?next=" + helpers.SanitizeInput(nextParam)
+		}
+		log.Printf("WARNING: No valid auth found, redirecting to: %s", redirectURL)
+		http.Redirect(w, r, redirectURL, http.StatusSeeOther)
+	}
+}
+
+// DashboardHandler menampilkan halaman dashboard
+// Protected route: menggunakan RequireAuth middleware untuk cek access token
+func DashboardHandler(w http.ResponseWriter, r *http.Request) {
+	// Cek access token dengan middleware
+	RequireAuth(func(w http.ResponseWriter, r *http.Request) {
+		// Token valid, lanjutkan render dashboard
+		renderDashboardWithToken(w, r)
+	})(w, r)
+}
+
+// renderDashboardWithToken render dashboard setelah token validated
+func renderDashboardWithToken(w http.ResponseWriter, r *http.Request) {
+	// Cek session (gunakan cookie name yang berbeda dari SSO server)
+	// PENTING: Hanya gunakan cookie client_dinas_session, JANGAN gunakan sso_admin_session dari SSO server
+	sessionID, err := helpers.GetCookie(r, "client_dinas_session")
+	if err != nil {
+		// Fallback ke session_id untuk backward compatibility (cookie lama dari direct login)
+		sessionID, err = helpers.GetCookie(r, "session_id")
+	}
+	var userID string
+	var ok bool
+
+	if err == nil && sessionID != "" {
+		// Validasi session jika ada
+		userID, ok, _ = session.ValidateSession(sessionID)
+	}
+
+	// Ambil data user jika session ada
+	var user map[string]interface{}
+	if ok && userID != "" {
+		user, err = getUserByIDForDashboard(userID)
+		if err != nil {
+			log.Printf("WARNING: Error getting user: %v", err)
+			// Lanjutkan dengan user kosong
+			user = make(map[string]interface{})
+		}
+	} else {
+		// Jika tidak ada session, gunakan user kosong
+		user = make(map[string]interface{})
+	}
+
+	// Ambil counts untuk dashboard
+	counts, err := getDashboardCounts()
+	if err != nil {
+		log.Printf("WARNING: Error getting counts: %v", err)
+		counts = map[string]int{
+			"pengguna": 0,
+			"aplikasi": 0,
+			"sessions": 0,
+			"tokens":   0,
+		}
+	}
+
+	// Render dashboard
+	renderDashboardPage(w, user, counts)
+}
+
+// getUserByID mengambil data user dari Supabase berdasarkan ID
+func getUserByID(userID string) (map[string]interface{}, error) {
+	supabaseURL := os.Getenv("SUPABASE_URL")
+	supabaseKey := os.Getenv("SUPABASE_KEY")
+	if supabaseURL == "" || supabaseKey == "" {
+		return nil, fmt.Errorf("SUPABASE_URL atau SUPABASE_KEY tidak di-set")
+	}
+
+	userIDEncoded := url.QueryEscape(userID)
+	// Schema: id_pengguna adalah primary key, bukan id
+	apiURL := fmt.Sprintf("%s/rest/v1/pengguna?id_pengguna=eq.%s&select=*", supabaseURL, userIDEncoded)
+
+	httpReq, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq.Header.Set("apikey", supabaseKey)
+	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var users []map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &users); err != nil {
+		return nil, err
+	}
+
+	if len(users) == 0 {
+		return nil, fmt.Errorf("user tidak ditemukan")
+	}
+
+	return users[0], nil
+}
+
+// getUserByIDForDashboard mengambil data user dari Supabase berdasarkan ID
+func getUserByIDForDashboard(userID string) (map[string]interface{}, error) {
+	return getUserByID(userID)
+}
+
+// getDashboardCounts mengambil jumlah pengguna, aplikasi, sessions, dan tokens
+func getDashboardCounts() (map[string]int, error) {
+	supabaseURL := os.Getenv("SUPABASE_URL")
+	supabaseKey := os.Getenv("SUPABASE_KEY")
+	if supabaseURL == "" || supabaseKey == "" {
+		return nil, fmt.Errorf("SUPABASE_URL atau SUPABASE_KEY tidak di-set")
+	}
+
+	counts := make(map[string]int)
+
+	// Untuk sementara, return default values
+	// TODO: Implement proper counting dengan Supabase count API
+	counts["pengguna"] = 0
+	counts["aplikasi"] = 0
+	counts["sessions"] = 0
+	counts["tokens"] = 0
+
+	return counts, nil
+}
+
+// renderDashboardPage menampilkan halaman dashboard
+func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, counts map[string]int) {
+	logoBase64 := base64.StdEncoding.EncodeToString(LogoData)
+	userName := "User"
+	if name, ok := user["nama_lengkap"].(string); ok && name != "" {
+		userName = name
+	} else if email, ok := user["email"].(string); ok {
+		userName = email
+	}
+
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - Dinas Pendidikan DKI Jakarta</title>
+    <link rel="icon" type="image/png" href="/logo.png">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #f1f5f9;
+            min-height: 100vh;
+        }
+        .navbar {
+            background: #1e40af;
+            color: white;
+            padding: 16px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .navbar-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        .navbar-logo {
+            height: 32px;
+        }
+        .navbar-title {
+            font-size: 18px;
+            font-weight: 600;
+        }
+        .navbar-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        .user-menu {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+            padding: 8px 12px;
+            border-radius: 8px;
+            transition: background 0.2s;
+        }
+        .user-menu:hover {
+            background: rgba(255,255,255,0.1);
+        }
+        .user-avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%%;
+            background: #3b82f6;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 14px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+        .welcome-section {
+            background: white;
+            border-radius: 12px;
+            padding: 32px;
+            margin-bottom: 24px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .welcome-title {
+            font-size: 28px;
+            font-weight: 600;
+            color: #1e293b;
+            margin-bottom: 8px;
+        }
+        .welcome-subtitle {
+            color: #64748b;
+            font-size: 16px;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .stat-card {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .stat-label {
+            color: #64748b;
+            font-size: 14px;
+            margin-bottom: 8px;
+        }
+        .stat-value {
+            font-size: 32px;
+            font-weight: 600;
+            color: #1e293b;
+        }
+        .actions-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 16px;
+        }
+        .action-card {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            text-decoration: none;
+            color: inherit;
+            display: block;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .action-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+        .action-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #1e293b;
+            margin-bottom: 8px;
+        }
+        .action-desc {
+            color: #64748b;
+            font-size: 14px;
+        }
+        .btn-logout {
+            background: #ef4444;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+        .btn-logout:hover {
+            background: #dc2626;
+        }
+        @media (max-width: 768px) {
+            .container { padding: 16px; }
+            .welcome-section { padding: 24px; }
+            .stats-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar">
+        <div class="navbar-left">
+            <img src="data:image/png;base64,%s" alt="Logo" class="navbar-logo">
+            <span class="navbar-title">Dinas Pendidikan DKI Jakarta</span>
+        </div>
+        <div class="navbar-right">
+            <div class="user-menu">
+                <div class="user-avatar">%s</div>
+                <span>%s</span>
+            </div>
+            <a href="/logout" class="btn-logout">Logout</a>
+        </div>
+    </nav>
+    <div class="container">
+        <div class="welcome-section">
+            <h1 class="welcome-title">Selamat Datang, %s!</h1>
+            <p class="welcome-subtitle">Dashboard Sistem Informasi Dinas Pendidikan</p>
+        </div>
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Total Pengguna</div>
+                <div class="stat-value">%d</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Aplikasi Terhubung</div>
+                <div class="stat-value">%d</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Sessions Aktif</div>
+                <div class="stat-value">%d</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Tokens</div>
+                <div class="stat-value">%d</div>
+            </div>
+        </div>
+        <div class="actions-grid">
+            <a href="/info-dinas" class="action-card">
+                <div class="action-title">📋 Informasi Dinas</div>
+                <div class="action-desc">Lihat informasi lengkap tentang Dinas Pendidikan DKI Jakarta</div>
+            </a>
+            <a href="/profile" class="action-card">
+                <div class="action-title">👤 Profil Saya</div>
+                <div class="action-desc">Kelola informasi profil dan pengaturan akun</div>
+            </a>
+            <a href="/news" class="action-card">
+                <div class="action-title">📰 Berita & Pengumuman</div>
+                <div class="action-desc">Baca berita dan pengumuman terbaru</div>
+            </a>
+            <a href="/services" class="action-card">
+                <div class="action-title">🛠️ Layanan</div>
+                <div class="action-desc">Akses berbagai layanan yang tersedia</div>
+            </a>
+        </div>
+    </div>
+</body>
+</html>`, logoBase64, string([]rune(userName)[0]), userName, userName, counts["pengguna"], counts["aplikasi"], counts["sessions"], counts["tokens"])
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(html))
+}
+
+// InfoDinasHandler menampilkan halaman Informasi Dinas Pendidikan
+// Protected route: hanya bisa diakses oleh user yang sudah login
+func InfoDinasHandler(w http.ResponseWriter, r *http.Request) {
+	// Cek session (gunakan cookie name yang berbeda dari SSO server)
+	// PENTING: Hanya gunakan cookie client_dinas_session, JANGAN gunakan sso_admin_session dari SSO server
+	sessionID, err := helpers.GetCookie(r, "client_dinas_session")
+	if err != nil {
+		// Fallback ke session_id untuk backward compatibility (cookie lama dari direct login)
+		sessionID, err = helpers.GetCookie(r, "session_id")
+	}
+	if err != nil || sessionID == "" {
+		log.Printf("WARNING: No session cookie found, redirecting to login")
+		http.Redirect(w, r, "/login?next=/info-dinas", http.StatusSeeOther)
+		return
+	}
+
+	// Validasi session
+	_, ok, err := session.ValidateSession(sessionID)
+	if !ok || err != nil {
+		log.Printf("WARNING: Invalid session: %v, error: %v", ok, err)
+		helpers.ClearCookie(w, "client_dinas_session")
+		helpers.ClearCookie(w, "session_id") // Clear juga untuk backward compatibility
+		http.Redirect(w, r, "/login?next=/info-dinas", http.StatusSeeOther)
+		return
+	}
+
+	// Ambil data aplikasi terhubung (jika tabel ada)
+	apps, _ := getAplikasiTerdaftar()
+
+	// Ambil data sekolah (jika tabel ada)
+	schools, _ := getDataSekolah(10)
+
+	// Render halaman
+	renderInfoDinasPage(w, apps, schools)
+}
+
+// getAplikasiTerdaftar mengambil daftar aplikasi terdaftar dari Supabase
+func getAplikasiTerdaftar() ([]map[string]interface{}, error) {
+	supabaseURL := os.Getenv("SUPABASE_URL")
+	supabaseKey := os.Getenv("SUPABASE_KEY")
+	if supabaseURL == "" || supabaseKey == "" {
+		return nil, fmt.Errorf("SUPABASE_URL atau SUPABASE_KEY tidak di-set")
+	}
+
+	// Coba ambil dari tabel aplikasi_terdaftar (jika ada)
+	apiURL := fmt.Sprintf("%s/rest/v1/aplikasi_terdaftar?select=*&limit=20", supabaseURL)
+	httpReq, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq.Header.Set("apikey", supabaseKey)
+	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		// Tabel mungkin tidak ada, return empty array
+		return []map[string]interface{}{}, nil
+	}
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	var apps []map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &apps); err != nil {
+		return nil, err
+	}
+
+	return apps, nil
+}
+
+// getDataSekolah mengambil data sekolah dari Supabase (limit)
+func getDataSekolah(limit int) ([]map[string]interface{}, error) {
+	supabaseURL := os.Getenv("SUPABASE_URL")
+	supabaseKey := os.Getenv("SUPABASE_KEY")
+	if supabaseURL == "" || supabaseKey == "" {
+		return nil, fmt.Errorf("SUPABASE_URL atau SUPABASE_KEY tidak di-set")
+	}
+
+	// Coba ambil dari tabel data_sekolah (jika ada)
+	apiURL := fmt.Sprintf("%s/rest/v1/data_sekolah?select=*&limit=%d", supabaseURL, limit)
+	httpReq, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq.Header.Set("apikey", supabaseKey)
+	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		// Tabel mungkin tidak ada, return demo data
+		return getDemoDataSekolah(), nil
+	}
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	var schools []map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &schools); err != nil {
+		return getDemoDataSekolah(), nil
+	}
+
+	if len(schools) == 0 {
+		return getDemoDataSekolah(), nil
+	}
+
+	return schools, nil
+}
+
+// getDemoDataSekolah mengembalikan data sekolah demo jika tabel tidak ada
+func getDemoDataSekolah() []map[string]interface{} {
+	return []map[string]interface{}{
+		{
+			"nama":      "SDN 01 Jakarta Pusat",
+			"alamat":    "Jl. Merdeka No. 1, Jakarta Pusat",
+			"jenis":     "SD",
+			"status":    "Negeri",
+			"kecamatan": "Gambir",
+		},
+		{
+			"nama":      "SMPN 15 Jakarta Selatan",
+			"alamat":    "Jl. Kebayoran Baru, Jakarta Selatan",
+			"jenis":     "SMP",
+			"status":    "Negeri",
+			"kecamatan": "Kebayoran Baru",
+		},
+		{
+			"nama":      "SMAN 28 Jakarta",
+			"alamat":    "Jl. Raya Pasar Minggu, Jakarta Selatan",
+			"jenis":     "SMA",
+			"status":    "Negeri",
+			"kecamatan": "Pasar Minggu",
+		},
+	}
+}
+
+// renderInfoDinasPage menampilkan halaman Informasi Dinas
+func renderInfoDinasPage(w http.ResponseWriter, apps []map[string]interface{}, schools []map[string]interface{}) {
+	logoBase64 := base64.StdEncoding.EncodeToString(LogoData)
+
+	// Generate HTML untuk aplikasi terhubung
+	appsHTML := ""
+	if len(apps) > 0 {
+		for _, app := range apps {
+			nama := fmt.Sprintf("%v", app["nama"])
+			deskripsi := fmt.Sprintf("%v", app["deskripsi"])
+			link := fmt.Sprintf("%v", app["link_akses"])
+			if link == "" {
+				link = "#"
+			}
+			appsHTML += fmt.Sprintf(`
+            <div class="app-card">
+                <h3>%s</h3>
+                <p>%s</p>
+                <a href="%s" class="app-link" target="_blank">Akses Aplikasi →</a>
+            </div>`, nama, deskripsi, link)
+		}
+	} else {
+		// Demo apps jika tidak ada data
+		appsHTML = `
+            <div class="app-card">
+                <h3>Sistem Informasi Akademik</h3>
+                <p>Platform untuk mengelola data akademik siswa dan guru</p>
+                <a href="#" class="app-link">Akses Aplikasi →</a>
+            </div>
+            <div class="app-card">
+                <h3>Portal PPDB Online</h3>
+                <p>Sistem pendaftaran peserta didik baru secara online</p>
+                <a href="#" class="app-link">Akses Aplikasi →</a>
+            </div>
+            <div class="app-card">
+                <h3>E-Learning Platform</h3>
+                <p>Platform pembelajaran daring untuk siswa dan guru</p>
+                <a href="#" class="app-link">Akses Aplikasi →</a>
+            </div>`
+	}
+
+	// Generate HTML untuk data sekolah
+	schoolsHTML := ""
+	for _, school := range schools {
+		nama := fmt.Sprintf("%v", school["nama"])
+		alamat := fmt.Sprintf("%v", school["alamat"])
+		jenis := fmt.Sprintf("%v", school["jenis"])
+		status := fmt.Sprintf("%v", school["status"])
+		schoolsHTML += fmt.Sprintf(`
+            <div class="school-card">
+                <h4>%s</h4>
+                <p><strong>Jenis:</strong> %s | <strong>Status:</strong> %s</p>
+                <p><strong>Alamat:</strong> %s</p>
+            </div>`, nama, jenis, status, alamat)
+	}
+
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Informasi Dinas - Dinas Pendidikan DKI Jakarta</title>
+    <link rel="icon" type="image/png" href="/logo.png">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #f1f5f9;
+            min-height: 100vh;
+        }
+        .navbar {
+            background: #1e40af;
+            color: white;
+            padding: 16px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .navbar-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        .navbar-logo {
+            height: 32px;
+        }
+        .navbar-title {
+            font-size: 18px;
+            font-weight: 600;
+        }
+        .navbar-right a {
+            color: white;
+            text-decoration: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            transition: background 0.2s;
+        }
+        .navbar-right a:hover {
+            background: rgba(255,255,255,0.1);
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+        .hero-section {
+            background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%);
+            color: white;
+            border-radius: 12px;
+            padding: 48px;
+            margin-bottom: 32px;
+            text-align: center;
+        }
+        .hero-title {
+            font-size: 36px;
+            font-weight: 700;
+            margin-bottom: 16px;
+        }
+        .hero-subtitle {
+            font-size: 18px;
+            opacity: 0.9;
+        }
+        .section {
+            background: white;
+            border-radius: 12px;
+            padding: 32px;
+            margin-bottom: 24px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .section-title {
+            font-size: 24px;
+            font-weight: 600;
+            color: #1e293b;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 2px solid #e2e8f0;
+        }
+        .apps-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 20px;
+        }
+        .app-card {
+            border: 2px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 24px;
+            transition: all 0.2s;
+        }
+        .app-card:hover {
+            border-color: #6366f1;
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.15);
+        }
+        .app-card h3 {
+            font-size: 18px;
+            font-weight: 600;
+            color: #1e293b;
+            margin-bottom: 12px;
+        }
+        .app-card p {
+            color: #64748b;
+            font-size: 14px;
+            margin-bottom: 16px;
+            line-height: 1.6;
+        }
+        .app-link {
+            color: #6366f1;
+            text-decoration: none;
+            font-weight: 500;
+            font-size: 14px;
+        }
+        .app-link:hover {
+            text-decoration: underline;
+        }
+        .about-content {
+            color: #475569;
+            line-height: 1.8;
+            font-size: 15px;
+        }
+        .about-content p {
+            margin-bottom: 16px;
+        }
+        .contact-info {
+            background: #f8fafc;
+            border-radius: 8px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+        .contact-info h4 {
+            font-size: 16px;
+            font-weight: 600;
+            color: #1e293b;
+            margin-bottom: 12px;
+        }
+        .contact-info p {
+            margin-bottom: 8px;
+            color: #475569;
+        }
+        .schools-list {
+            display: grid;
+            gap: 16px;
+        }
+        .school-card {
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 20px;
+            transition: all 0.2s;
+        }
+        .school-card:hover {
+            border-color: #6366f1;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .school-card h4 {
+            font-size: 18px;
+            font-weight: 600;
+            color: #1e293b;
+            margin-bottom: 12px;
+        }
+        .school-card p {
+            color: #64748b;
+            font-size: 14px;
+            margin-bottom: 8px;
+        }
+        @media (max-width: 768px) {
+            .container { padding: 16px; }
+            .hero-section { padding: 32px 24px; }
+            .hero-title { font-size: 28px; }
+            .section { padding: 24px; }
+            .apps-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar">
+        <div class="navbar-left">
+            <img src="data:image/png;base64,%s" alt="Logo" class="navbar-logo">
+            <span class="navbar-title">Dinas Pendidikan DKI Jakarta</span>
+        </div>
+        <div class="navbar-right">
+            <a href="/dashboard">Dashboard</a>
+            <a href="/profile">Profil</a>
+            <a href="/logout">Logout</a>
+        </div>
+    </nav>
+    <div class="container">
+        <div class="hero-section">
+            <h1 class="hero-title">Selamat Datang di SSO Dinas Pendidikan</h1>
+            <p class="hero-subtitle">Portal Terpadu untuk Layanan Pendidikan DKI Jakarta</p>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">Aplikasi Terhubung</h2>
+            <div class="apps-grid">
+                %s
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">Tentang Dinas</h2>
+            <div class="about-content">
+                <p>
+                    Dinas Pendidikan Provinsi DKI Jakarta adalah instansi pemerintah yang bertanggung jawab 
+                    dalam pengelolaan dan pengembangan sistem pendidikan di wilayah DKI Jakarta. Kami berkomitmen 
+                    untuk memberikan layanan pendidikan yang berkualitas dan mudah diakses oleh seluruh masyarakat.
+                </p>
+                <p>
+                    Visi kami adalah mewujudkan pendidikan yang merata, berkualitas, dan berkarakter untuk 
+                    membentuk generasi yang unggul dan berdaya saing. Misi kami meliputi peningkatan akses 
+                    pendidikan, peningkatan kualitas pembelajaran, dan penguatan tata kelola pendidikan.
+                </p>
+                <div class="contact-info">
+                    <h4>Kontak & Informasi</h4>
+                    <p><strong>Alamat:</strong> Jl. Jenderal Gatot Subroto, Jakarta Selatan</p>
+                    <p><strong>Telepon:</strong> (021) 1234-5678</p>
+                    <p><strong>Email:</strong> info@pendidikan.jakarta.go.id</p>
+                    <p><strong>Website:</strong> <a href="https://pendidikan.jakarta.go.id" target="_blank">pendidikan.jakarta.go.id</a></p>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">Data Sekolah (Demo)</h2>
+            <div class="schools-list">
+                %s
+            </div>
+        </div>
+    </div>
+</body>
+</html>`, logoBase64, appsHTML, schoolsHTML)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(html))
+}
+
+// SSOConfig menyimpan konfigurasi SSO
+type SSOConfig struct {
+	SSOServerURL string
+	ClientID     string
+	RedirectURI  string
+	StateSecret  string // Untuk validasi state
+}
+
+// getSSOConfig mengambil konfigurasi SSO dari environment variables
+// Auto-detect environment berdasarkan request host jika tidak di-set
+func getSSOConfig() SSOConfig {
+	// Cek environment variable terlebih dahulu
+	ssoServerURL := os.Getenv("SSO_SERVER_URL")
+
+	// Jika tidak di-set, auto-detect berdasarkan request host
+	// Untuk development: default ke localhost:8080
+	// Untuk production: default ke production URL
+	if ssoServerURL == "" {
+		// Default untuk development (lebih aman)
+		// User harus set SSO_SERVER_URL untuk production
+		ssoServerURL = "http://localhost:8080"
+	}
+
+	// Pastikan URL memiliki protocol
+	if !strings.HasPrefix(ssoServerURL, "http://") && !strings.HasPrefix(ssoServerURL, "https://") {
+		// Auto-detect: jika localhost, gunakan http, else https
+		if strings.Contains(ssoServerURL, "localhost") {
+			ssoServerURL = "http://" + ssoServerURL
+		} else {
+			ssoServerURL = "https://" + ssoServerURL
+		}
+	}
+
+	// Default callback URL
+	redirectURI := getEnvOrDefault("SSO_REDIRECT_URI", "")
+	if redirectURI == "" {
+		// Auto-detect berdasarkan SSO server URL
+		if strings.Contains(ssoServerURL, "localhost") {
+			redirectURI = "http://localhost:8070/api/callback"
+		} else {
+			redirectURI = "https://client-dinas-pendidikan.vercel.app/api/callback"
+		}
+	}
+
+	return SSOConfig{
+		SSOServerURL: ssoServerURL,
+		ClientID:     getEnvOrDefault("SSO_CLIENT_ID", "client-dinas-pendidikan"),
+		RedirectURI:  redirectURI,
+		StateSecret:  getEnvOrDefault("SSO_STATE_SECRET", ""),
+	}
+}
+
+// getEnvOrDefault mengambil environment variable atau return default value
+func getEnvOrDefault(key, defaultValue string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+	return value
+}
+
+// SSOAuthorizeHandler menangani request untuk memulai SSO flow
+// Redirect ke SSO authorize endpoint: http://localhost:8080/apps/access?client_id=client-dinas-pendidikan
+func SSOAuthorizeHandler(w http.ResponseWriter, r *http.Request) {
+	config := getSSOConfig()
+	if config.ClientID == "" {
+		log.Println("ERROR: SSO_CLIENT_ID tidak di-set")
+		helpers.WriteError(w, http.StatusInternalServerError, "Konfigurasi SSO tidak lengkap")
+		return
+	}
+
+	// Generate state untuk CSRF protection
+	state, err := generateState()
+	if err != nil {
+		log.Printf("ERROR generating state: %v", err)
+		helpers.WriteError(w, http.StatusInternalServerError, "Gagal memulai proses SSO")
+		return
+	}
+
+	// Simpan state di cookie untuk validasi saat callback
+	helpers.SetCookie(w, "sso_state", state, 600) // 10 menit
+
+	// Build authorize URL sesuai format SSO server
+	// Format: http://localhost:8080/apps/access?client_id=client-dinas-pendidikan
+	authorizeURL := fmt.Sprintf("%s/apps/access", config.SSOServerURL)
+	params := url.Values{}
+	params.Set("client_id", config.ClientID)
+	params.Set("state", state) // Optional: tambahkan state jika SSO support
+
+	authorizeURLWithParams := fmt.Sprintf("%s?%s", authorizeURL, params.Encode())
+
+	log.Printf("✅ Redirecting to SSO: %s", authorizeURLWithParams)
+	http.Redirect(w, r, authorizeURLWithParams, http.StatusFound)
+}
+
+// TokenResponse menyimpan response dari token exchange
+type TokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
+	Scope       string `json:"scope"`
+}
+
+// UserInfo menyimpan informasi user dari SSO
+type UserInfo struct {
+	Sub           string `json:"sub"`
+	Email         string `json:"email"`
+	Name          string `json:"name"`
+	EmailVerified bool   `json:"email_verified"`
+}
+
+// generateState menghasilkan random state untuk CSRF protection
+func generateState() (string, error) {
+	randomBytes := make([]byte, 16)
+	if _, err := rand.Read(randomBytes); err != nil {
+		return "", fmt.Errorf("gagal generate state: %v", err)
+	}
+	return base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(randomBytes), nil
+}
+
+// min helper function
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// exchangeCodeForToken menukar authorization code dengan access token
+func exchangeCodeForToken(code string, config SSOConfig) (*TokenResponse, error) {
+	tokenURL := fmt.Sprintf("%s/api/token", config.SSOServerURL)
+	log.Printf("📡 Token URL: %s", tokenURL)
+
+	// Prepare form data sesuai requirement
+	formData := url.Values{}
+	formData.Set("grant_type", "authorization_code")
+	formData.Set("code", code)
+	formData.Set("redirect_uri", config.RedirectURI)
+	formData.Set("client_id", config.ClientID)
+
+	// Log request details untuk debugging
+	requestBody := formData.Encode()
+	log.Printf("📤 Request to SSO:")
+	log.Printf("   URL: %s", tokenURL)
+	log.Printf("   Method: POST")
+	log.Printf("   Content-Type: application/x-www-form-urlencoded")
+	log.Printf("   Body: grant_type=authorization_code&code=%s&redirect_uri=%s&client_id=%s",
+		code[:minInt(10, len(code))]+"...", config.RedirectURI, config.ClientID)
+	log.Printf("   Full body length: %d bytes", len(requestBody))
+
+	// Create POST request
+	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(formData.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("gagal membuat request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	// Execute request
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("❌ Network error: %v", err)
+		return nil, fmt.Errorf("gagal memanggil SSO server: %v", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	log.Printf("📥 Response from SSO:")
+	log.Printf("   Status: %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+	log.Printf("   Content-Type: %s", resp.Header.Get("Content-Type"))
+	log.Printf("   Body: %s", string(bodyBytes))
+	log.Printf("   Body length: %d bytes", len(bodyBytes))
+
+	if resp.StatusCode != http.StatusOK {
+		// Log error detail untuk debugging
+		log.Printf("❌ Token exchange failed:")
+		log.Printf("   Request URL: %s", tokenURL)
+		log.Printf("   Status: %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+		log.Printf("   Response Body: %s", string(bodyBytes))
+
+		// Coba parse error response jika ada
+		var errorResp map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &errorResp); err == nil {
+			if errorMsg, ok := errorResp["error"].(string); ok {
+				errorDesc := ""
+				if desc, ok := errorResp["error_description"].(string); ok {
+					errorDesc = desc
+				} else if desc, ok := errorResp["error_description"].(interface{}); ok {
+					errorDesc = fmt.Sprintf("%v", desc)
+				}
+				return nil, fmt.Errorf("%s: %s", errorMsg, errorDesc)
+			}
+		}
+
+		// Jika response bukan JSON (misalnya 404 dari Vercel), return error dengan body
+		return nil, fmt.Errorf("token exchange gagal: status %d, response: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var tokenResponse TokenResponse
+	if err := json.Unmarshal(bodyBytes, &tokenResponse); err != nil {
+		log.Printf("❌ ERROR parsing token response: %v, Body: %s", err, string(bodyBytes))
+		return nil, fmt.Errorf("gagal parse token response: %v", err)
+	}
+
+	if tokenResponse.AccessToken == "" {
+		return nil, fmt.Errorf("access_token tidak ditemukan di response")
+	}
+
+	return &tokenResponse, nil
+}
+
+// getUserInfoFromSSO mengambil informasi user dari SSO menggunakan access token
+func getUserInfoFromSSO(accessToken string, config SSOConfig) (*UserInfo, error) {
+	userInfoURL := fmt.Sprintf("%s/api/userinfo", config.SSOServerURL)
+
+	req, err := http.NewRequest("GET", userInfoURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("gagal membuat request: %v", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gagal memanggil SSO server: %v", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("ERROR SSO userinfo response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("userinfo request gagal: status %d", resp.StatusCode)
+	}
+
+	// Log raw response untuk debugging
+	log.Printf("📥 SSO userinfo raw response: %s", string(bodyBytes))
+
+	var userInfo UserInfo
+	if err := json.Unmarshal(bodyBytes, &userInfo); err != nil {
+		log.Printf("ERROR parsing userinfo response: %v, Body: %s", err, string(bodyBytes))
+		return nil, fmt.Errorf("gagal parse userinfo response: %v", err)
+	}
+
+	// Log user info untuk debugging
+	log.Printf("📋 User info from SSO (parsed):")
+	log.Printf("   Email: %s", userInfo.Email)
+	log.Printf("   Name: %s", userInfo.Name)
+	log.Printf("   Sub: %s", userInfo.Sub)
+
+	// Jika Name kosong, coba parse dari response langsung (mungkin field berbeda)
+	if userInfo.Name == "" {
+		var rawResponse map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &rawResponse); err == nil {
+			// Coba berbagai field name yang mungkin
+			if name, ok := rawResponse["nama_lengkap"].(string); ok && name != "" {
+				userInfo.Name = name
+				log.Printf("   ✅ Found name from 'nama_lengkap': %s", name)
+			} else if name, ok := rawResponse["full_name"].(string); ok && name != "" {
+				userInfo.Name = name
+				log.Printf("   ✅ Found name from 'full_name': %s", name)
+			} else if name, ok := rawResponse["nama"].(string); ok && name != "" {
+				userInfo.Name = name
+				log.Printf("   ✅ Found name from 'nama': %s", name)
+			} else {
+				log.Printf("   ⚠️  Name not found in response. Available fields: %v", getMapKeys(rawResponse))
+			}
+		}
+	}
+
+	return &userInfo, nil
+}
+
+// findOrCreateUser mencari user di database atau membuat baru jika tidak ada
+func findOrCreateUser(userInfo *UserInfo) (interface{}, error) {
+	supabaseURL := os.Getenv("SUPABASE_URL")
+	supabaseKey := os.Getenv("SUPABASE_KEY")
+	if supabaseURL == "" || supabaseKey == "" {
+		return nil, fmt.Errorf("SUPABASE_URL atau SUPABASE_KEY tidak di-set")
+	}
+
+	// Cari user berdasarkan email
+	emailEncoded := url.QueryEscape(userInfo.Email)
+	apiURL := fmt.Sprintf("%s/rest/v1/pengguna?email=eq.%s&select=*", supabaseURL, emailEncoded)
+
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("gagal membuat request: %v", err)
+	}
+
+	req.Header.Set("apikey", supabaseKey)
+	req.Header.Set("Authorization", "Bearer "+supabaseKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gagal memanggil Supabase: %v", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("ERROR Supabase response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("gagal query user: status %d", resp.StatusCode)
+	}
+
+	var users []map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &users); err != nil {
+		return nil, fmt.Errorf("gagal parse response: %v", err)
+	}
+
+	// Jika user sudah ada, update nama dari SSO jika berbeda
+	if len(users) > 0 {
+		existingUser := users[0]
+		userID := existingUser["id_pengguna"]
+		if userID == nil {
+			// Fallback ke id jika id_pengguna tidak ada
+			userID = existingUser["id"]
+		}
+
+		// Update nama_lengkap dari SSO jika berbeda
+		existingName, _ := existingUser["nama_lengkap"].(string)
+		if userInfo.Name != "" && existingName != userInfo.Name {
+			log.Printf("🔄 Updating user name from SSO: %s -> %s", existingName, userInfo.Name)
+			// Update nama di database
+			userIDEncoded := url.QueryEscape(fmt.Sprintf("%v", userID))
+			updateURL := fmt.Sprintf("%s/rest/v1/pengguna?id_pengguna=eq.%s", supabaseURL, userIDEncoded)
+
+			updateData := map[string]interface{}{
+				"nama_lengkap": userInfo.Name,
+			}
+			updateJSON, _ := json.Marshal(updateData)
+
+			updateReq, err := http.NewRequest("PATCH", updateURL, strings.NewReader(string(updateJSON)))
+			if err == nil {
+				updateReq.Header.Set("apikey", supabaseKey)
+				updateReq.Header.Set("Authorization", "Bearer "+supabaseKey)
+				updateReq.Header.Set("Content-Type", "application/json")
+				updateReq.Header.Set("Prefer", "return=representation")
+
+				updateResp, err := http.DefaultClient.Do(updateReq)
+				if err == nil {
+					updateResp.Body.Close()
+					log.Printf("✅ User name updated: %s", userInfo.Name)
+				}
+			}
+		}
+
+		return userID, nil
+	}
+
+	// Jika user belum ada, buat baru
+	userData := map[string]interface{}{
+		"email":        userInfo.Email,
+		"nama_lengkap": userInfo.Name,
+		"aktif":        true,
+		"peran":        "user", // Default role
+	}
+
+	userJSON, _ := json.Marshal(userData)
+	apiURL = fmt.Sprintf("%s/rest/v1/pengguna", supabaseURL)
+
+	req, err = http.NewRequest("POST", apiURL, strings.NewReader(string(userJSON)))
+	if err != nil {
+		return nil, fmt.Errorf("gagal membuat request: %v", err)
+	}
+
+	req.Header.Set("apikey", supabaseKey)
+	req.Header.Set("Authorization", "Bearer "+supabaseKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Prefer", "return=representation")
+
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gagal membuat user: %v", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ = io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		log.Printf("ERROR Supabase create user response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("gagal membuat user: status %d", resp.StatusCode)
+	}
+
+	var newUsers []map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &newUsers); err != nil {
+		return nil, fmt.Errorf("gagal parse response: %v", err)
+	}
+
+	if len(newUsers) == 0 {
+		return nil, fmt.Errorf("user tidak dibuat")
+	}
+
+	log.Printf("✅ User created: %s (nama: %s)", userInfo.Email, userInfo.Name)
+	// Return id_pengguna jika ada, fallback ke id
+	userID := newUsers[0]["id_pengguna"]
+	if userID == nil {
+		userID = newUsers[0]["id"]
+	}
+	return userID, nil
+}
+
+// SSOCallbackHandler menangani callback dari SSO setelah user login
+// Flow:
+// 1. Terima authorization code dari query parameter
+// 2. Validasi state parameter
+// 3. Exchange code ke access token
+// 4. Ambil user info dari SSO
+// 5. Buat session user di client
+// 6. Redirect ke dashboard
+func SSOCallbackHandler(w http.ResponseWriter, r *http.Request) {
+	// Log request untuk debugging
+	log.Printf("📥 SSO Callback received:")
+	log.Printf("   Method: %s", r.Method)
+	log.Printf("   URL: %s", r.URL.String())
+	log.Printf("   Host: %s", r.Host)
+	log.Printf("   RemoteAddr: %s", r.RemoteAddr)
+
+	// Parse query parameters
+	code := r.URL.Query().Get("code")
+	state := r.URL.Query().Get("state")
+	errorParam := r.URL.Query().Get("error")
+	errorDescription := r.URL.Query().Get("error_description")
+
+	log.Printf("   Code: %s", func() string {
+		if code != "" {
+			return code[:minInt(10, len(code))] + "..."
+		}
+		return "(empty)"
+	}())
+	log.Printf("   State: %s", func() string {
+		if state != "" {
+			return state[:minInt(10, len(state))] + "..."
+		}
+		return "(empty)"
+	}())
+	log.Printf("   Error: %s", errorParam)
+
+	// Handle error dari SSO
+	if errorParam != "" {
+		log.Printf("ERROR from SSO: %s - %s", errorParam, errorDescription)
+		http.Redirect(w, r, "/login?error=sso_error&message="+url.QueryEscape(errorDescription), http.StatusSeeOther)
+		return
+	}
+
+	// Validasi code
+	if code == "" {
+		log.Println("ERROR: Authorization code tidak ditemukan")
+		http.Redirect(w, r, "/login?error=missing_code", http.StatusSeeOther)
+		return
+	}
+
+	// Validasi state (optional, jika SSO mengirim state)
+	if state != "" {
+		stateCookie, err := helpers.GetCookie(r, "sso_state")
+		if err == nil && stateCookie != "" {
+			if state != stateCookie {
+				log.Printf("ERROR: State mismatch. Expected: %s, Got: %s", stateCookie, state)
+				http.Redirect(w, r, "/login?error=state_mismatch", http.StatusSeeOther)
+				return
+			}
+			// Clear state cookie setelah digunakan
+			helpers.ClearCookie(w, "sso_state")
+		}
+	}
+
+	// Exchange code ke access token (tanpa PKCE)
+	config := getSSOConfig()
+	log.Printf("🔄 Exchanging code to token:")
+	log.Printf("   SSO Server URL: %s", config.SSOServerURL)
+	log.Printf("   Redirect URI: %s", config.RedirectURI)
+	log.Printf("   Client ID: %s", config.ClientID)
+	log.Printf("   Code: %s...", code[:minInt(10, len(code))])
+	tokenResponse, err := exchangeCodeForToken(code, config)
+	if err != nil {
+		log.Printf("❌ ERROR exchanging code for token: %v", err)
+		// Redirect dengan error message yang lebih detail
+		errorMsg := url.QueryEscape(fmt.Sprintf("Gagal menukar authorization code: %v", err))
+		http.Redirect(w, r, "/login?error=token_exchange_failed&message="+errorMsg, http.StatusSeeOther)
+		return
+	}
+	log.Printf("✅ Token exchange berhasil: token_type=%s, expires_in=%d", tokenResponse.TokenType, tokenResponse.ExpiresIn)
+
+	// Simpan access token di cookie (untuk digunakan di protected routes)
+	// Token expires dalam expires_in detik (default 3600 = 1 jam)
+	tokenExpiresIn := tokenResponse.ExpiresIn
+	if tokenExpiresIn == 0 {
+		tokenExpiresIn = 3600 // Default 1 jam
+	}
+	helpers.SetCookie(w, "sso_access_token", tokenResponse.AccessToken, tokenExpiresIn)
+
+	// Simpan token expires timestamp (current time + expires_in)
+	tokenExpiresAt := time.Now().Unix() + int64(tokenExpiresIn)
+	helpers.SetCookie(w, "sso_token_expires", fmt.Sprintf("%d", tokenExpiresAt), tokenExpiresIn)
+
+	log.Printf("✅ Token saved: expires in %d seconds", tokenExpiresIn)
+
+	// Ambil user info dari SSO (opsional, untuk mendapatkan email dan nama)
+	userInfo, err := getUserInfoFromSSO(tokenResponse.AccessToken, config)
+	if err != nil {
+		log.Printf("WARNING: Error getting user info: %v, akan lanjutkan tanpa user info", err)
+		// Tetap lanjutkan, redirect ke dashboard
+		// User info bisa diambil nanti jika diperlukan
+	} else {
+		// Buat atau update user di database client
+		userEmail := userInfo.Email
+		if userEmail != "" {
+			// Cari atau buat user di database
+			userID, err := findOrCreateUser(userInfo)
+			if err != nil {
+				log.Printf("WARNING: Error finding/creating user: %v", err)
+			} else {
+				// Buat session di database client
+				sessionID, err := session.CreateSession(userID, r)
+				if err != nil {
+					log.Printf("WARNING: Error creating session: %v", err)
+				} else {
+					// Set cookie session dengan nama yang berbeda dari SSO server
+					// PENTING: Gunakan cookie name yang berbeda untuk mencegah shared cookie
+					// SSO server menggunakan "sso_admin_session", client website menggunakan "client_dinas_session"
+					helpers.SetCookie(w, "client_dinas_session", sessionID, 86400) // 24 jam
+					log.Printf("✅ User session created: %s, session: %s", userEmail, sessionID)
+				}
+			}
+		}
+	}
+
+	// Redirect ke dashboard
+	next := r.URL.Query().Get("next")
+	if next == "" {
+		next = "/dashboard"
+	}
+	http.Redirect(w, r, next, http.StatusSeeOther)
+}
+
+// ProfileHandler menampilkan dan mengelola halaman profil user
+// Protected route: hanya bisa diakses oleh user yang sudah login
+func ProfileHandler(w http.ResponseWriter, r *http.Request) {
+	// Cek session (gunakan cookie name yang berbeda dari SSO server)
+	// PENTING: Hanya gunakan cookie client_dinas_session, JANGAN gunakan sso_admin_session dari SSO server
+	sessionID, err := helpers.GetCookie(r, "client_dinas_session")
+	if err != nil {
+		// Fallback ke session_id untuk backward compatibility (cookie lama dari direct login)
+		sessionID, err = helpers.GetCookie(r, "session_id")
+	}
+	if err != nil || sessionID == "" {
+		log.Printf("WARNING: No session cookie found, redirecting to login")
+		http.Redirect(w, r, "/login?next=/profile", http.StatusSeeOther)
+		return
+	}
+
+	// Validasi session
+	userID, ok, err := session.ValidateSession(sessionID)
+	if !ok || err != nil {
+		log.Printf("WARNING: Invalid session: %v, error: %v", ok, err)
+		helpers.ClearCookie(w, "client_dinas_session")
+		helpers.ClearCookie(w, "session_id") // Clear juga untuk backward compatibility
+		http.Redirect(w, r, "/login?next=/profile", http.StatusSeeOther)
+		return
+	}
+
+	// Handle POST untuk update profile
+	if r.Method == "POST" {
+		handleUpdateProfile(w, r, userID)
+		return
+	}
+
+	// GET: tampilkan form profil
+	user, err := getUserByID(userID)
+	if err != nil {
+		log.Printf("ERROR getting user: %v", err)
+		helpers.WriteError(w, http.StatusInternalServerError, "Gagal mengambil data user")
+		return
+	}
+
+	renderProfilePageNew(w, user)
+}
+
+// handleUpdateProfile menangani update profil user
+func handleUpdateProfile(w http.ResponseWriter, r *http.Request, userID string) {
+	// Parse form data
+	if err := r.ParseForm(); err != nil {
+		helpers.WriteError(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
+
+	namaLengkap := r.FormValue("nama_lengkap")
+	email := r.FormValue("email")
+
+	// Validasi
+	if !helpers.ValidateEmail(email) {
+		helpers.WriteError(w, http.StatusBadRequest, "Email tidak valid")
+		return
+	}
+
+	if len(namaLengkap) < 3 {
+		helpers.WriteError(w, http.StatusBadRequest, "Nama lengkap minimal 3 karakter")
+		return
+	}
+
+	// Update di Supabase
+	supabaseURL := os.Getenv("SUPABASE_URL")
+	supabaseKey := os.Getenv("SUPABASE_KEY")
+	if supabaseURL == "" || supabaseKey == "" {
+		helpers.WriteError(w, http.StatusInternalServerError, "Konfigurasi server tidak lengkap")
+		return
+	}
+
+	updateData := map[string]interface{}{
+		"nama_lengkap": namaLengkap,
+		"email":        email,
+	}
+
+	updateJSON, _ := json.Marshal(updateData)
+	userIDEncoded := url.QueryEscape(userID)
+	// Schema: id_pengguna adalah primary key, bukan id
+	apiURL := fmt.Sprintf("%s/rest/v1/pengguna?id_pengguna=eq.%s", supabaseURL, userIDEncoded)
+
+	httpReq, err := http.NewRequest("PATCH", apiURL, bytes.NewBuffer(updateJSON))
+	if err != nil {
+		log.Printf("ERROR creating request: %v", err)
+		helpers.WriteError(w, http.StatusInternalServerError, "Terjadi kesalahan")
+		return
+	}
+
+	httpReq.Header.Set("apikey", supabaseKey)
+	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		log.Printf("ERROR calling Supabase: %v", err)
+		helpers.WriteError(w, http.StatusInternalServerError, "Gagal mengupdate profil")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		log.Printf("ERROR Supabase response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
+		helpers.WriteError(w, http.StatusInternalServerError, "Gagal mengupdate profil")
+		return
+	}
+
+	// Redirect kembali ke profile dengan success message
+	http.Redirect(w, r, "/profile?success=1", http.StatusSeeOther)
+}
+
+// renderProfilePageNew menampilkan halaman profil (versi baru untuk handler modular)
+func renderProfilePageNew(w http.ResponseWriter, user map[string]interface{}) {
+	logoBase64 := base64.StdEncoding.EncodeToString(LogoData)
+	namaLengkap := ""
+	email := ""
+	peran := ""
+
+	if n, ok := user["nama_lengkap"].(string); ok {
+		namaLengkap = n
+	}
+	if e, ok := user["email"].(string); ok {
+		email = e
+	}
+	if p, ok := user["peran"].(string); ok {
+		peran = p
+	}
+
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Profil - Dinas Pendidikan DKI Jakarta</title>
+    <link rel="icon" type="image/png" href="/logo.png">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #f1f5f9;
+            min-height: 100vh;
+        }
+        .navbar {
+            background: #1e40af;
+            color: white;
+            padding: 16px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .navbar-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        .navbar-logo {
+            height: 32px;
+        }
+        .navbar-title {
+            font-size: 18px;
+            font-weight: 600;
+        }
+        .navbar-right a {
+            color: white;
+            text-decoration: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            transition: background 0.2s;
+        }
+        .navbar-right a:hover {
+            background: rgba(255,255,255,0.1);
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+        .profile-card {
+            background: white;
+            border-radius: 12px;
+            padding: 32px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .profile-header {
+            margin-bottom: 32px;
+        }
+        .profile-title {
+            font-size: 28px;
+            font-weight: 600;
+            color: #1e293b;
+            margin-bottom: 8px;
+        }
+        .profile-subtitle {
+            color: #64748b;
+            font-size: 16px;
+        }
+        .form-group {
+            margin-bottom: 24px;
+        }
+        .form-group label {
+            display: block;
+            color: #334155;
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 8px;
+        }
+        .form-group input,
+        .form-group select {
+            width: 100%%;
+            padding: 12px 16px;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 15px;
+            transition: all 0.2s;
+            background: #f8fafc;
+        }
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: #6366f1;
+            background: white;
+        }
+        .form-group input:disabled {
+            background: #e2e8f0;
+            cursor: not-allowed;
+        }
+        .btn-primary {
+            background: #6366f1;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-primary:hover {
+            background: #4f46e5;
+        }
+        .success-message {
+            background: #d1fae5;
+            color: #065f46;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 24px;
+            display: none;
+        }
+        .success-message.show {
+            display: block;
+        }
+        @media (max-width: 768px) {
+            .container { padding: 16px; }
+            .profile-card { padding: 24px; }
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar">
+        <div class="navbar-left">
+            <img src="data:image/png;base64,%s" alt="Logo" class="navbar-logo">
+            <span class="navbar-title">Dinas Pendidikan DKI Jakarta</span>
+        </div>
+        <div class="navbar-right">
+            <a href="/dashboard">Dashboard</a>
+            <a href="/info-dinas">Informasi</a>
+            <a href="/logout">Logout</a>
+        </div>
+    </nav>
+    <div class="container">
+        <div class="profile-card">
+            <div class="profile-header">
+                <h1 class="profile-title">Profil Saya</h1>
+                <p class="profile-subtitle">Kelola informasi profil dan pengaturan akun Anda</p>
+            </div>
+            <div class="success-message" id="successMsg">
+                Profil berhasil diperbarui!
+            </div>
+            <form method="POST" action="/profile">
+                <div class="form-group">
+                    <label for="nama_lengkap">Nama Lengkap</label>
+                    <input type="text" id="nama_lengkap" name="nama_lengkap" value="%s" required>
+                </div>
+                <div class="form-group">
+                    <label for="email">Email</label>
+                    <input type="email" id="email" name="email" value="%s" required>
+                </div>
+                <div class="form-group">
+                    <label for="peran">Peran</label>
+                    <input type="text" id="peran" name="peran" value="%s" disabled>
+                </div>
+                <button type="submit" class="btn-primary">Simpan Perubahan</button>
+            </form>
+            <div style="margin-top: 32px; padding-top: 32px; border-top: 1px solid #e2e8f0;">
+                <h3 style="font-size: 18px; font-weight: 600; color: #1e293b; margin-bottom: 16px;">Ubah Password</h3>
+                <p style="color: #64748b; margin-bottom: 16px;">Untuk mengubah password, silakan gunakan fitur "Ubah Password" di halaman profil lengkap.</p>
+                <a href="/profile" style="color: #6366f1; text-decoration: none; font-weight: 500;">Buka Halaman Profil Lengkap →</a>
+            </div>
+        </div>
+    </div>
+    <script>
+        // Tampilkan success message jika ada parameter success
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.get('success') === '1') {
+            document.getElementById('successMsg').classList.add('show');
+            setTimeout(() => {
+                document.getElementById('successMsg').classList.remove('show');
+            }, 3000);
+        }
+    </script>
+</body>
+</html>`, logoBase64, namaLengkap, email, peran)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(html))
+}
+
+// LogoutHandler menangani proses logout user
+// Flow:
+// 1. Ambil session ID dari cookie client_dinas_session
+// 2. Revoke session di database (DELETE dari database)
+// 3. Clear SEMUA cookie terkait auth client website
+// 4. Redirect ke halaman home (/)
+// PENTING: Logout di client website TIDAK logout dari SSO server (OAuth 2.0 standard)
+func LogoutHandler(w http.ResponseWriter, r *http.Request) {
+	// Ambil session ID dari cookie client website
+	// PENTING: Gunakan cookie name yang berbeda dari SSO server
+	sessionID, err := helpers.GetCookie(r, "client_dinas_session")
+	if err == nil && sessionID != "" {
+		// Revoke session di database (DELETE)
+		if err := session.ClearSession(sessionID); err != nil {
+			log.Printf("WARNING: Error clearing session: %v", err)
+			// Lanjutkan meskipun error, tetap clear cookie
+		} else {
+			log.Printf("✅ Session revoked from database: %s", sessionID)
+		}
+	}
+
+	// Clear SEMUA cookie terkait auth client website
+	// PENTING: Hanya hapus cookie client website, TIDAK hapus cookie SSO server
+	helpers.ClearCookie(w, "client_dinas_session") // Session dari client website
+	helpers.ClearCookie(w, "sso_access_token")     // Access token dari SSO (OAuth 2.0)
+	helpers.ClearCookie(w, "sso_token_expires")    // Token expiration
+	helpers.ClearCookie(w, "sso_state")            // State untuk CSRF protection
+	helpers.ClearCookie(w, "sso_code_verifier")    // PKCE verifier (jika ada)
+
+	// Clear cookie lama untuk backward compatibility
+	helpers.ClearCookie(w, "session_id")
+	// PENTING: Jangan clear sso_admin_session karena itu cookie dari SSO server
+	// Logout di client website tidak seharusnya logout dari SSO server (OAuth 2.0 standard)
+
+	log.Printf("✅ All auth cookies cleared, user logged out")
+
+	// Redirect ke home
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 // checkSSOSession checks if user has valid SSO session and creates local session
