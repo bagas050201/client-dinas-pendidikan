@@ -1585,6 +1585,30 @@ func getUserInfoFromSSO(accessToken string, config SSOConfig) (*UserInfo, error)
 	// Parse field tambahan dari raw response jika tidak ada di struct
 	var rawResponse map[string]interface{}
 	if err := json.Unmarshal(bodyBytes, &rawResponse); err == nil {
+		// Parse Email dari berbagai field yang mungkin (PENTING: email wajib ada)
+		if userInfo.Email == "" {
+			// Coba berbagai field name untuk email
+			if email, ok := rawResponse["email"].(string); ok && email != "" {
+				userInfo.Email = email
+				log.Printf("   ✅ Found email from 'email': %s", email)
+			} else if email, ok := rawResponse["user_email"].(string); ok && email != "" {
+				userInfo.Email = email
+				log.Printf("   ✅ Found email from 'user_email': %s", email)
+			} else if email, ok := rawResponse["mail"].(string); ok && email != "" {
+				userInfo.Email = email
+				log.Printf("   ✅ Found email from 'mail': %s", email)
+			} else if sub, ok := rawResponse["sub"].(string); ok && sub != "" {
+				// Jika sub adalah email (biasanya di OAuth 2.0)
+				if strings.Contains(sub, "@") {
+					userInfo.Email = sub
+					log.Printf("   ✅ Found email from 'sub' (as email): %s", sub)
+				}
+			} else {
+				log.Printf("   ❌ Email not found in response. Available fields: %v", getMapKeys(rawResponse))
+				log.Printf("   📋 Full response: %s", string(bodyBytes))
+			}
+		}
+
 		// Parse Name dari berbagai field yang mungkin
 		if userInfo.Name == "" {
 			if name, ok := rawResponse["nama_lengkap"].(string); ok && name != "" {
@@ -1593,6 +1617,9 @@ func getUserInfoFromSSO(accessToken string, config SSOConfig) (*UserInfo, error)
 			} else if name, ok := rawResponse["full_name"].(string); ok && name != "" {
 				userInfo.Name = name
 				log.Printf("   ✅ Found name from 'full_name': %s", name)
+			} else if name, ok := rawResponse["name"].(string); ok && name != "" {
+				userInfo.Name = name
+				log.Printf("   ✅ Found name from 'name': %s", name)
 			} else if name, ok := rawResponse["nama"].(string); ok && name != "" {
 				userInfo.Name = name
 				log.Printf("   ✅ Found name from 'nama': %s", name)
@@ -1619,6 +1646,94 @@ func getUserInfoFromSSO(accessToken string, config SSOConfig) (*UserInfo, error)
 	// Gunakan Role jika Peran kosong
 	if userInfo.Peran == "" && userInfo.Role != "" {
 		userInfo.Peran = userInfo.Role
+	}
+
+	// FALLBACK: Jika email masih tidak ditemukan, coba decode dari access token JWT
+	// Ini workaround untuk SSO server yang mengembalikan JWT claims bukan user info
+	if userInfo.Email == "" && userInfo.Sub != "" {
+		log.Printf("⚠️  Email tidak ditemukan di userinfo, mencoba decode dari access token...")
+
+		// Decode JWT token tanpa validasi (karena kita hanya perlu claims)
+		// Format JWT: header.payload.signature
+		parts := strings.Split(accessToken, ".")
+		if len(parts) == 3 {
+			// Decode payload (base64url)
+			payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+			if err == nil {
+				var tokenClaims map[string]interface{}
+				if err := json.Unmarshal(payloadBytes, &tokenClaims); err == nil {
+					log.Printf("📋 JWT Token claims: %v", getMapKeys(tokenClaims))
+
+					// Coba ambil email dari token claims
+					if email, ok := tokenClaims["email"].(string); ok && email != "" {
+						userInfo.Email = email
+						log.Printf("   ✅ Found email from JWT token claims: %s", email)
+					}
+
+					// Coba ambil name dari token claims
+					if userInfo.Name == "" {
+						if name, ok := tokenClaims["name"].(string); ok && name != "" {
+							userInfo.Name = name
+							log.Printf("   ✅ Found name from JWT token claims: %s", name)
+						} else if name, ok := tokenClaims["nama_lengkap"].(string); ok && name != "" {
+							userInfo.Name = name
+							log.Printf("   ✅ Found name from JWT token claims (nama_lengkap): %s", name)
+						}
+					}
+
+					// Coba ambil peran dari token claims
+					if userInfo.Peran == "" {
+						if peran, ok := tokenClaims["peran"].(string); ok && peran != "" {
+							userInfo.Peran = peran
+							log.Printf("   ✅ Found peran from JWT token claims: %s", peran)
+						} else if role, ok := tokenClaims["role"].(string); ok && role != "" {
+							userInfo.Peran = role
+							log.Printf("   ✅ Found peran from JWT token claims (role): %s", role)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// FALLBACK 2: Jika masih tidak ada email, coba ambil dari SSO server menggunakan sub
+	// Query SSO server untuk mendapatkan user info berdasarkan sub
+	if userInfo.Email == "" && userInfo.Sub != "" {
+		log.Printf("⚠️  Email masih tidak ditemukan, mencoba query SSO server dengan sub: %s", userInfo.Sub)
+
+		// Coba ambil user info dari SSO server menggunakan sub
+		// Endpoint mungkin berbeda, coba beberapa kemungkinan
+		userInfoEndpoints := []string{
+			fmt.Sprintf("%s/api/users/%s", config.SSOServerURL, userInfo.Sub),
+			fmt.Sprintf("%s/api/user/%s", config.SSOServerURL, userInfo.Sub),
+			fmt.Sprintf("%s/api/users?sub=%s", config.SSOServerURL, userInfo.Sub),
+		}
+
+		for _, endpoint := range userInfoEndpoints {
+			req, err := http.NewRequest("GET", endpoint, nil)
+			if err != nil {
+				continue
+			}
+			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				continue
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				var userData map[string]interface{}
+				if err := json.Unmarshal(bodyBytes, &userData); err == nil {
+					if email, ok := userData["email"].(string); ok && email != "" {
+						userInfo.Email = email
+						log.Printf("   ✅ Found email from SSO server endpoint %s: %s", endpoint, email)
+						break
+					}
+				}
+			}
+		}
 	}
 
 	return &userInfo, nil
