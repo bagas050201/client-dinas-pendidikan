@@ -379,7 +379,7 @@ func LoginPostHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Verifikasi password
 	var passwordMatch bool
-	if passwordHash, ok := user["password_hash"].(string); ok && passwordHash != "" {
+	if passwordHash, ok := user["password"].(string); ok && passwordHash != "" {
 		// Cek dengan bcrypt
 		if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err == nil {
 			passwordMatch = true
@@ -842,6 +842,24 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
         <div class="welcome-section">
             <h1 class="welcome-title">Selamat Datang, %s!</h1>
             <p class="welcome-subtitle">Dashboard Sistem Informasi Dinas Pendidikan</p>
+        </div>
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Total Pengguna</div>
+                <div class="stat-value">%d</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Aplikasi Terhubung</div>
+                <div class="stat-value">%d</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Sessions Aktif</div>
+                <div class="stat-value">%d</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Tokens</div>
+                <div class="stat-value">%d</div>
+            </div>
         </div>
         <div class="actions-grid">
             <a href="/info-dinas" class="action-card">
@@ -2143,6 +2161,11 @@ func renderProfilePageNew(w http.ResponseWriter, user map[string]interface{}) {
                 </div>
                 <button type="submit" class="btn-primary">Simpan Perubahan</button>
             </form>
+            <div style="margin-top: 32px; padding-top: 32px; border-top: 1px solid #e2e8f0;">
+                <h3 style="font-size: 18px; font-weight: 600; color: #1e293b; margin-bottom: 16px;">Ubah Password</h3>
+                <p style="color: #64748b; margin-bottom: 16px;">Untuk mengubah password, silakan gunakan fitur "Ubah Password" di halaman profil lengkap.</p>
+                <a href="/profile" style="color: #6366f1; text-decoration: none; font-weight: 500;">Buka Halaman Profil Lengkap →</a>
+            </div>
         </div>
     </div>
     <script>
@@ -2870,15 +2893,15 @@ func handleLoginAPI(w http.ResponseWriter, r *http.Request) {
 
 	user := users[0]
 
-	// Try password_hash first, fallback to password (for backward compatibility)
+	// Verify password
 	var passwordMatch bool
-	if passwordHash, ok := user["password_hash"].(string); ok && passwordHash != "" {
+	if passwordHash, ok := user["password"].(string); ok && passwordHash != "" {
 		// Verify password with bcrypt
 		if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err == nil {
 			passwordMatch = true
 		}
 	} else {
-		// Try password field (plain text for existing data)
+		// Fallback: Try password_hash field (for backward compatibility)
 		if password, ok := user["password"].(string); ok {
 			if password == req.Password {
 				passwordMatch = true
@@ -3036,11 +3059,11 @@ func handleRegisterAPI(w http.ResponseWriter, r *http.Request) {
 
 	// Create user
 	userData := map[string]interface{}{
-		"email":         req.Email,
-		"password_hash": string(hashedPassword),
-		"nama_lengkap":  helpers.SanitizeInput(req.NamaLengkap),
-		"peran":         req.Peran,
-		"aktif":         true,
+		"email":        req.Email,
+		"password":     string(hashedPassword),
+		"nama_lengkap": helpers.SanitizeInput(req.NamaLengkap),
+		"peran":        req.Peran,
+		"aktif":        true,
 	}
 
 	userJSON, _ := json.Marshal(userData)
@@ -3085,34 +3108,33 @@ func handleRegisterAPI(w http.ResponseWriter, r *http.Request) {
 
 	newUser := newUsers[0]
 
-	// Auto-login: Create session
-	sessionID, _ := helpers.GenerateSessionID()
-	expiresAt := time.Now().Add(24 * time.Hour)
-
-	sessionData := map[string]interface{}{
-		"user_id":    newUser["id"],
-		"session_id": sessionID,
-		"ip_address": getIPAddress(r),
-		"user_agent": r.UserAgent(),
-		"expires_at": expiresAt.Format(time.RFC3339),
+	// Auto-login: Create session menggunakan session.CreateSession
+	// Schema: id_pengguna adalah primary key, bukan id
+	userIDVal := newUser["id_pengguna"]
+	if userIDVal == nil {
+		// Fallback ke id jika id_pengguna tidak ada (untuk backward compatibility)
+		userIDVal = newUser["id"]
+		if userIDVal == nil {
+			log.Printf("ERROR: User tidak memiliki kolom id_pengguna atau id. User keys: %v", getMapKeys(newUser))
+			helpers.WriteError(w, http.StatusInternalServerError, "Data user tidak valid")
+			return
+		}
 	}
 
-	sessionJSON, _ := json.Marshal(sessionData)
-	apiURL = fmt.Sprintf("%s/rest/v1/sesi_login", getSupabaseURL())
-	httpReq, err = http.NewRequest("POST", apiURL, bytes.NewBuffer(sessionJSON))
+	// Convert userID ke string untuk konsistensi
+	userID := fmt.Sprintf("%v", userIDVal)
+
+	// Buat session menggunakan session.CreateSession
+	sessionID, err := session.CreateSession(userID, r)
 	if err != nil {
-		log.Printf("ERROR creating request: %v", err)
-		// Continue anyway, session creation is not critical for registration
+		log.Printf("WARNING: Error creating session: %v", err)
+		// Lanjutkan meskipun error, registrasi tetap berhasil
 	} else {
-		httpReq.Header.Set("apikey", getSupabaseKey())
-		httpReq.Header.Set("Authorization", "Bearer "+getSupabaseKey())
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Prefer", "return=representation")
-		http.DefaultClient.Do(httpReq)
+		// Set cookie dengan nama yang berbeda dari SSO server
+		// PENTING: Gunakan cookie name yang berbeda untuk mencegah shared cookie
+		helpers.SetCookie(w, "client_dinas_session", sessionID, 86400) // 24 jam
+		log.Printf("✅ Session created for new user: %s", sessionID)
 	}
-
-	// Set cookie
-	helpers.SetCookie(w, "session_id", sessionID, 86400)
 
 	// Return success with redirect instruction
 	helpers.WriteJSON(w, http.StatusOK, map[string]interface{}{
@@ -3276,7 +3298,7 @@ func handleChangePasswordAPI(w http.ResponseWriter, r *http.Request) {
 	if userIDValue == nil {
 		userIDValue = user["id"]
 	}
-	url := fmt.Sprintf("%s/rest/v1/pengguna?id_pengguna=eq.%v&select=password_hash", getSupabaseURL(), userIDValue)
+	url := fmt.Sprintf("%s/rest/v1/pengguna?id_pengguna=eq.%v&select=password", getSupabaseURL(), userIDValue)
 	httpReq, _ := http.NewRequest("GET", url, nil)
 	httpReq.Header.Set("apikey", getSupabaseKey())
 	httpReq.Header.Set("Authorization", "Bearer "+getSupabaseKey())
@@ -3295,7 +3317,7 @@ func handleChangePasswordAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	passwordHash := fmt.Sprintf("%v", users[0]["password_hash"])
+	passwordHash := fmt.Sprintf("%v", users[0]["password"])
 
 	// Verify old password
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.OldPassword)); err != nil {
@@ -3312,8 +3334,8 @@ func handleChangePasswordAPI(w http.ResponseWriter, r *http.Request) {
 
 	// Update password
 	updateData := map[string]interface{}{
-		"password_hash": string(newHashedPassword),
-		"updated_at":    time.Now().Format(time.RFC3339),
+		"password":   string(newHashedPassword),
+		"updated_at": time.Now().Format(time.RFC3339),
 	}
 
 	updateJSON, _ := json.Marshal(updateData)
@@ -4138,6 +4160,16 @@ func renderRegisterPage(w http.ResponseWriter, errorMsg string) {
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(formData)
                 });
+                
+                // Cek status code
+                if (!res.ok) {
+                    const errorData = await res.json().catch(() => ({ error: 'Registrasi gagal' }));
+                    showError(errorData.error || 'Registrasi gagal');
+                    btn.disabled = false;
+                    btn.textContent = originalText;
+                    return;
+                }
+                
                 const data = await res.json();
                 if (data.success) {
                     // Redirect to home page after successful registration
@@ -4148,6 +4180,7 @@ func renderRegisterPage(w http.ResponseWriter, errorMsg string) {
                     btn.textContent = originalText;
                 }
             } catch (error) {
+                console.error('Register error:', error);
                 showError('Terjadi kesalahan. Silakan coba lagi.');
                 btn.disabled = false;
                 btn.textContent = originalText;
