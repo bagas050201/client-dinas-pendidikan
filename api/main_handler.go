@@ -1880,34 +1880,62 @@ func SSOCallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("✅ Token saved: expires in %d seconds", tokenExpiresIn)
 
-	// Ambil user info dari SSO (opsional, untuk mendapatkan email dan nama)
+	// Ambil user info dari SSO (WAJIB untuk membuat session)
 	userInfo, err := getUserInfoFromSSO(tokenResponse.AccessToken, config)
 	if err != nil {
-		log.Printf("WARNING: Error getting user info: %v, akan lanjutkan tanpa user info", err)
-		// Tetap lanjutkan, redirect ke dashboard
-		// User info bisa diambil nanti jika diperlukan
-	} else {
-		// Buat atau update user di database client
-		userEmail := userInfo.Email
-		if userEmail != "" {
-			// Cari atau buat user di database
-			userID, err := findOrCreateUser(userInfo)
-			if err != nil {
-				log.Printf("WARNING: Error finding/creating user: %v", err)
-			} else {
-				// Buat session di database client
-				sessionID, err := session.CreateSession(userID, r)
-				if err != nil {
-					log.Printf("WARNING: Error creating session: %v", err)
-				} else {
-					// Set cookie session dengan nama yang berbeda dari SSO server
-					// PENTING: Gunakan cookie name yang berbeda untuk mencegah shared cookie
-					// SSO server menggunakan "sso_admin_session", client website menggunakan "client_dinas_session"
-					helpers.SetCookie(w, r, "client_dinas_session", sessionID, 86400) // 24 jam
-					log.Printf("✅ User session created: %s, session: %s", userEmail, sessionID)
-				}
-			}
-		}
+		log.Printf("❌ ERROR getting user info: %v", err)
+		log.Printf("⚠️  Cannot create session without user info, redirecting to login")
+		http.Redirect(w, r, "/login?error=userinfo_failed&message="+url.QueryEscape("Gagal mengambil informasi user dari SSO"), http.StatusSeeOther)
+		return
+	}
+
+	// Pastikan email ada
+	if userInfo.Email == "" {
+		log.Printf("❌ ERROR: Email tidak ditemukan di user info")
+		http.Redirect(w, r, "/login?error=missing_email&message="+url.QueryEscape("Email tidak ditemukan"), http.StatusSeeOther)
+		return
+	}
+
+	log.Printf("📋 User info dari SSO:")
+	log.Printf("   Email: %s", userInfo.Email)
+	log.Printf("   Name: %s", userInfo.Name)
+	log.Printf("   Peran: %s", userInfo.Peran)
+
+	// Buat atau update user di database client
+	userID, err := findOrCreateUser(userInfo)
+	if err != nil {
+		log.Printf("❌ ERROR finding/creating user: %v", err)
+		http.Redirect(w, r, "/login?error=user_creation_failed&message="+url.QueryEscape("Gagal membuat user"), http.StatusSeeOther)
+		return
+	}
+
+	log.Printf("✅ User found/created: %v", userID)
+
+	// Buat session di database client (WAJIB)
+	sessionID, err := session.CreateSession(userID, r)
+	if err != nil {
+		log.Printf("❌ ERROR creating session: %v", err)
+		http.Redirect(w, r, "/login?error=session_creation_failed&message="+url.QueryEscape("Gagal membuat session"), http.StatusSeeOther)
+		return
+	}
+
+	log.Printf("✅ Session created: %s", sessionID)
+
+	// Set cookie session dengan nama yang berbeda dari SSO server
+	// PENTING: Gunakan cookie name yang berbeda untuk mencegah shared cookie
+	// SSO server menggunakan "sso_admin_session", client website menggunakan "client_dinas_session"
+	helpers.SetCookie(w, r, "client_dinas_session", sessionID, 86400) // 24 jam
+	log.Printf("✅ Cookie 'client_dinas_session' set: %s", sessionID)
+
+	// Log cookie settings untuk debugging
+	log.Printf("🔍 Cookie settings:")
+	log.Printf("   Request Host: %s", r.Host)
+	log.Printf("   Request URL: %s", r.URL.String())
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		log.Printf("   X-Forwarded-Proto: %s", proto)
+	}
+	if r.TLS != nil {
+		log.Printf("   TLS: true")
 	}
 
 	// Redirect ke dashboard
@@ -1915,6 +1943,7 @@ func SSOCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	if next == "" {
 		next = "/dashboard"
 	}
+	log.Printf("🔄 Redirecting to: %s", next)
 	http.Redirect(w, r, next, http.StatusSeeOther)
 }
 
