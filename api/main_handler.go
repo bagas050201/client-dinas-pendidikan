@@ -3121,12 +3121,26 @@ func handleLoginAPI(w http.ResponseWriter, r *http.Request) {
 	sessionID, _ := helpers.GenerateSessionID()
 	expiresAt := time.Now().Add(24 * time.Hour)
 
+	// Schema: id_pengguna adalah primary key, bukan id
+	userID := user["id_pengguna"]
+	if userID == nil {
+		// Fallback ke id jika id_pengguna tidak ada (untuk backward compatibility)
+		userID = user["id"]
+		if userID == nil {
+			log.Printf("ERROR: User tidak memiliki kolom id_pengguna atau id. User keys: %v", getMapKeys(user))
+			helpers.WriteError(w, http.StatusInternalServerError, "Data user tidak valid")
+			return
+		}
+	}
+
+	// Siapkan data session sesuai schema Supabase
+	// Schema: id (uuid, PK), id_sesi (text), id_pengguna (uuid), created_at (timestamp), kadaluarsa (timestamp), ip (text), user_agent (text), aktif (bool)
 	sessionData := map[string]interface{}{
-		"user_id":    user["id"],
-		"session_id": sessionID,
-		"ip_address": getIPAddress(r),
-		"user_agent": r.UserAgent(),
-		"expires_at": expiresAt.Format(time.RFC3339),
+		"id_pengguna": userID,                         // user_id → id_pengguna
+		"id_sesi":     sessionID,                      // session_id → id_sesi
+		"ip":          getIPAddress(r),                // ip_address → ip
+		"user_agent":  r.UserAgent(),                  // user_agent (sudah benar)
+		"kadaluarsa":  expiresAt.Format(time.RFC3339), // expires_at → kadaluarsa
 	}
 
 	sessionJSON, _ := json.Marshal(sessionData)
@@ -3378,8 +3392,14 @@ func handleGetProfileAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Schema: id_pengguna adalah primary key, bukan id
+	userID := user["id_pengguna"]
+	if userID == nil {
+		userID = user["id"] // Fallback untuk backward compatibility
+	}
+
 	helpers.WriteSuccess(w, "Profile retrieved", map[string]interface{}{
-		"id":           user["id"],
+		"id_pengguna":  userID,
 		"email":        user["email"],
 		"nama_lengkap": user["nama_lengkap"],
 		"peran":        user["peran"],
@@ -3437,10 +3457,10 @@ func handleUpdateProfileAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update user
+	// Schema: tidak ada kolom updated_at di tabel pengguna
 	updateData := map[string]interface{}{
 		"nama_lengkap": helpers.SanitizeInput(req.NamaLengkap),
 		"email":        req.Email,
-		"updated_at":   time.Now().Format(time.RFC3339),
 	}
 
 	updateJSON, _ := json.Marshal(updateData)
@@ -3530,9 +3550,9 @@ func handleChangePasswordAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update password
+	// Schema: tidak ada kolom updated_at di tabel pengguna
 	updateData := map[string]interface{}{
-		"password":   string(newHashedPassword),
-		"updated_at": time.Now().Format(time.RFC3339),
+		"password": string(newHashedPassword),
 	}
 
 	updateJSON, _ := json.Marshal(updateData)
