@@ -843,24 +843,6 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
             <h1 class="welcome-title">Selamat Datang, %s!</h1>
             <p class="welcome-subtitle">Dashboard Sistem Informasi Dinas Pendidikan</p>
         </div>
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-label">Total Pengguna</div>
-                <div class="stat-value">%d</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Aplikasi Terhubung</div>
-                <div class="stat-value">%d</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Sessions Aktif</div>
-                <div class="stat-value">%d</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Tokens</div>
-                <div class="stat-value">%d</div>
-            </div>
-        </div>
         <div class="actions-grid">
             <a href="/info-dinas" class="action-card">
                 <div class="action-title">📋 Informasi Dinas</div>
@@ -2161,11 +2143,6 @@ func renderProfilePageNew(w http.ResponseWriter, user map[string]interface{}) {
                 </div>
                 <button type="submit" class="btn-primary">Simpan Perubahan</button>
             </form>
-            <div style="margin-top: 32px; padding-top: 32px; border-top: 1px solid #e2e8f0;">
-                <h3 style="font-size: 18px; font-weight: 600; color: #1e293b; margin-bottom: 16px;">Ubah Password</h3>
-                <p style="color: #64748b; margin-bottom: 16px;">Untuk mengubah password, silakan gunakan fitur "Ubah Password" di halaman profil lengkap.</p>
-                <a href="/profile" style="color: #6366f1; text-decoration: none; font-weight: 500;">Buka Halaman Profil Lengkap →</a>
-            </div>
         </div>
     </div>
     <script>
@@ -3812,12 +3789,6 @@ func renderLoginPage(w http.ResponseWriter, errorMsg, email string) {
         <div class="divider">
             <span>atau</span>
         </div>
-        <a href="/sso/authorize" class="btn-sso">
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path>
-            </svg>
-            Login dengan SSO
-        </a>
         <div class="link-text">
             Belum punya akun? <a href="/register">Daftar di sini</a>
         </div>
