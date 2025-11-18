@@ -132,8 +132,12 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		// Handler untuk memulai SSO flow
 		SSOAuthorizeHandler(w, r)
 		return
+	case "/oauth/callback":
+		// Handler untuk callback dari SSO setelah login (endpoint baru)
+		SSOCallbackHandler(w, r)
+		return
 	case "/callback":
-		// Handler untuk callback dari SSO setelah login
+		// Handler untuk callback dari SSO setelah login (kompatibilitas)
 		SSOCallbackHandler(w, r)
 		return
 	default:
@@ -147,6 +151,9 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 	method := r.Method
 
 	switch {
+	case path == "/oauth/callback" && method == "GET":
+		// Handler untuk callback dari SSO (endpoint baru: /oauth/callback)
+		SSOCallbackHandler(w, r)
 	case path == "/api/callback" && method == "GET":
 		// Handler untuk callback dari SSO (support /api/callback untuk kompatibilitas)
 		SSOCallbackHandler(w, r)
@@ -1366,9 +1373,9 @@ func getSSOConfig() SSOConfig {
 	if redirectURI == "" {
 		// Auto-detect berdasarkan SSO server URL
 		if strings.Contains(ssoServerURL, "localhost") {
-			redirectURI = "http://localhost:8070/api/callback"
+			redirectURI = "http://localhost:8070/oauth/callback"
 		} else {
-			redirectURI = "https://client-dinas-pendidikan.vercel.app/api/callback"
+			redirectURI = "https://client-dinas-pendidikan.vercel.app/oauth/callback"
 		}
 	}
 
