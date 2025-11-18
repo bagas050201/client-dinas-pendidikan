@@ -30,7 +30,7 @@ echo ""
 echo "📤 Sending request..."
 echo ""
 
-curl -X POST "$SSO_SERVER/api/token" \
+curl -X POST "$SSO_SERVER/oauth/token" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -d "grant_type=authorization_code" \
   -d "code=$CODE" \

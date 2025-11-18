@@ -1460,7 +1460,7 @@ func minInt(a, b int) int {
 
 // exchangeCodeForToken menukar authorization code dengan access token
 func exchangeCodeForToken(code string, config SSOConfig) (*TokenResponse, error) {
-	tokenURL := fmt.Sprintf("%s/api/token", config.SSOServerURL)
+	tokenURL := fmt.Sprintf("%s/oauth/token", config.SSOServerURL)
 	log.Printf("📡 Token URL: %s", tokenURL)
 
 	// Prepare form data sesuai requirement
@@ -1543,7 +1543,7 @@ func exchangeCodeForToken(code string, config SSOConfig) (*TokenResponse, error)
 
 // getUserInfoFromSSO mengambil informasi user dari SSO menggunakan access token
 func getUserInfoFromSSO(accessToken string, config SSOConfig) (*UserInfo, error) {
-	userInfoURL := fmt.Sprintf("%s/api/userinfo", config.SSOServerURL)
+	userInfoURL := fmt.Sprintf("%s/oauth/userinfo", config.SSOServerURL)
 
 	req, err := http.NewRequest("GET", userInfoURL, nil)
 	if err != nil {

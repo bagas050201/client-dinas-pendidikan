@@ -142,7 +142,7 @@ TokenResponse {
 ```
 
 #### **Proses yang Terjadi:**
-1. Build token URL: `{SSOServerURL}/api/token`
+1. Build token URL: `{SSOServerURL}/oauth/token`
 2. Prepare form data:
    ```
    grant_type=authorization_code
@@ -160,7 +160,7 @@ TokenResponse {
 
 #### **Request ke SSO Server:**
 ```
-POST {SSOServerURL}/api/token
+POST {SSOServerURL}/oauth/token
 Content-Type: application/x-www-form-urlencoded
 
 grant_type=authorization_code&code=aBc123XyZ&redirect_uri=https://client.com/api/callback&client_id=client-id
@@ -205,7 +205,7 @@ UserInfo {
 ```
 
 #### **Proses yang Terjadi:**
-1. Build userinfo URL: `{SSOServerURL}/api/userinfo`
+1. Build userinfo URL: `{SSOServerURL}/oauth/userinfo`
 2. GET request dengan header `Authorization: Bearer {access_token}`
 3. Parse JSON response ke `UserInfo`
 4. **Fallback parsing** jika field tidak ditemukan:
@@ -220,7 +220,7 @@ UserInfo {
 
 #### **Request ke SSO Server:**
 ```
-GET {SSOServerURL}/api/userinfo
+GET {SSOServerURL}/oauth/userinfo
 Authorization: Bearer {access_token}
 ```
 
@@ -403,9 +403,9 @@ Set-Cookie: sso_token_expires={timestamp}; Path=/; HttpOnly; Secure; SameSite=La
 | **5. Generate Code** | SSO generate `authorization_code` | | SSO membuat code unik |
 | **6. Redirect Callback** | SSO redirect ke `{redirect_uri}?code={code}&state={state}` | `SSOCallbackHandler()` menerima callback | SSO mengirim code ke client |
 | **7. Validate** | | Validasi `code` dan `state` | Client validasi untuk security |
-| **8. Exchange Token** | SSO menerima POST `/api/token` | `exchangeCodeForToken()` → POST ke SSO | Client menukar code ke token |
+| **8. Exchange Token** | SSO menerima POST `/oauth/token` | `exchangeCodeForToken()` → POST ke SSO | Client menukar code ke token |
 | **9. Return Token** | SSO return `access_token` | Menerima `TokenResponse` | SSO mengirim access token |
-| **10. Get User Info** | SSO menerima GET `/api/userinfo` | `getUserInfoFromSSO()` → GET ke SSO | Client ambil user info |
+| **10. Get User Info** | SSO menerima GET `/oauth/userinfo` | `getUserInfoFromSSO()` → GET ke SSO | Client ambil user info |
 | **11. Return User Info** | SSO return user info JSON | Menerima `UserInfo` | SSO mengirim data user |
 | **12. Find/Create User** | | `findOrCreateUser()` → Query database `pengguna` | Client cari/buat user |
 | **13. Create Session** | | `session.CreateSession()` → Insert ke `sesi_login` | Client buat session |
@@ -421,9 +421,9 @@ Set-Cookie: sso_token_expires={timestamp}; Path=/; HttpOnly; Secure; SameSite=La
 | **6. Receive Callback** | Redirect dengan query params | `SSOCallbackHandler()` parse query | `code=aBc123`, `state=xyz789` | ✅ Received |
 | **7. Validate Code** | - | Check `code != ""` | `code` string | ✅ Valid |
 | **7b. Validate State** | - | Compare `state` dengan cookie `sso_state` | `state` string | ✅ Match |
-| **8. Exchange Request** | Receive POST request | `exchangeCodeForToken()` build request | `POST /api/token`<br>`grant_type=authorization_code`<br>`code=aBc123`<br>`redirect_uri=...`<br>`client_id=...` | 📤 Sending |
+| **8. Exchange Request** | Receive POST request | `exchangeCodeForToken()` build request | `POST /oauth/token`<br>`grant_type=authorization_code`<br>`code=aBc123`<br>`redirect_uri=...`<br>`client_id=...` | 📤 Sending |
 | **9. Token Response** | Return JSON response | Parse `TokenResponse` | `{access_token: "...", expires_in: 3600}` | ✅ Received |
-| **10. UserInfo Request** | Receive GET request | `getUserInfoFromSSO()` build request | `GET /api/userinfo`<br>`Authorization: Bearer {token}` | 📤 Sending |
+| **10. UserInfo Request** | Receive GET request | `getUserInfoFromSSO()` build request | `GET /oauth/userinfo`<br>`Authorization: Bearer {token}` | 📤 Sending |
 | **11. UserInfo Response** | Return JSON response | Parse `UserInfo` | `{sub: "...", email: "...", name: "...", peran: "admin"}` | ✅ Received |
 | **12. Query User** | - | `findOrCreateUser()` query DB | `GET /rest/v1/pengguna?email=eq.{email}` | 📤 Querying |
 | **12b. User Found** | - | Update user if needed | `PATCH /rest/v1/pengguna?id_pengguna=eq.{id}` | ✅ Updated |
@@ -452,8 +452,8 @@ Set-Cookie: sso_token_expires={timestamp}; Path=/; HttpOnly; Secure; SameSite=La
 | **Step** | **Input Data** | **Transformation** | **Output Data** | **Storage** |
 |----------|---------------|-------------------|-----------------|-------------|
 | **1. Callback** | Query params: `code`, `state` | Parse URL query | `code` string, `state` string | Memory |
-| **2. Exchange** | `code` + `config` | POST to SSO `/api/token` | `TokenResponse` {access_token, expires_in} | Memory + Cookie |
-| **3. UserInfo** | `access_token` + `config` | GET to SSO `/api/userinfo` | `UserInfo` {sub, email, name, peran} | Memory |
+| **2. Exchange** | `code` + `config` | POST to SSO `/oauth/token` | `TokenResponse` {access_token, expires_in} | Memory + Cookie |
+| **3. UserInfo** | `access_token` + `config` | GET to SSO `/oauth/userinfo` | `UserInfo` {sub, email, name, peran} | Memory |
 | **4. Find User** | `UserInfo.Email` | Query DB `pengguna` | `userID` (uuid) | Database |
 | **5. Create User** | `UserInfo` (if not found) | INSERT to DB `pengguna` | `userID` (uuid) | Database |
 | **6. Create Session** | `userID` + Request | INSERT to DB `sesi_login` | `sessionID` (string) | Database + Cookie |
@@ -706,7 +706,7 @@ curl "http://localhost:8080/api/callback?code=test123&state=xyz789"
 ### **2. Test Token Exchange**
 ```bash
 # Test exchange code (harus dari SSO server yang valid)
-curl -X POST "https://sso-server.com/api/token" \
+curl -X POST "https://sso-server.com/oauth/token" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -d "grant_type=authorization_code&code=test123&redirect_uri=https://client.com/api/callback&client_id=client-id"
 ```
@@ -714,7 +714,7 @@ curl -X POST "https://sso-server.com/api/token" \
 ### **3. Test User Info**
 ```bash
 # Test get user info
-curl "https://sso-server.com/api/userinfo" \
+curl "https://sso-server.com/oauth/userinfo" \
   -H "Authorization: Bearer {access_token}"
 ```
 
@@ -724,7 +724,7 @@ curl "https://sso-server.com/api/userinfo" \
 
 ### **Problem: "Email tidak ditemukan"**
 **Solution:**
-- Pastikan SSO server mengembalikan field `email` di `/api/userinfo`
+- Pastikan SSO server mengembalikan field `email` di `/oauth/userinfo`
 - Implementasi fallback parsing di `getUserInfoFromSSO()`
 - Cek log untuk melihat field apa saja yang dikembalikan SSO
 
