@@ -1,5 +1,8 @@
 # Requirements untuk SSO Server (localhost:8080)
 
+Requirements untuk SSO server
+Masih relevan untuk konfigurasi
+
 ## ✅ Yang Sudah Benar (Tidak Perlu Diubah)
 
 SSO server sudah mengikuti OAuth 2.0 standard dengan benar:

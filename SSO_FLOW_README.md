@@ -1,5 +1,9 @@
 # 📚 Dokumentasi Alur SSO (Single Sign-On)
 
+Membahas Supabase (24 matches)
+Dokumentasi alur SSO dengan database Supabase
+Arsitektur dan flow diagram
+
 Dokumentasi lengkap untuk memahami alur SSO di Client Website Dinas Pendidikan DKI Jakarta.
 
 ---

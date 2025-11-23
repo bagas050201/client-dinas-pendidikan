@@ -1,5 +1,9 @@
 # Flow Mendapatkan Data User dari SSO dan Menampilkannya
 
+Membahas Supabase (31 matches)
+Flow mendapatkan data user dari SSO dan menyimpan ke Supabase
+Penjelasan tabel pengguna dan sesi_login di Supabase
+
 ## 📋 Overview
 
 Dokumen ini menjelaskan bagaimana website client mendapatkan data user dari SSO Keycloak dan menampilkannya di halaman website.
