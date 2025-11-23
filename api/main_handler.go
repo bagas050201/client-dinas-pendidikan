@@ -25,6 +25,9 @@ import (
 //go:embed logo.png
 var LogoData []byte
 
+//go:embed static/sso-handler.js
+var SSOHandlerJS []byte
+
 // getSupabaseURL returns SUPABASE_URL from environment
 func getSupabaseURL() string {
 	return os.Getenv("SUPABASE_URL")
@@ -61,6 +64,14 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Serve static JavaScript files
+	if path == "/static/sso-handler.js" || path == "/sso-handler.js" {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Write(SSOHandlerJS)
+		return
+	}
+
 	// API routes
 	if strings.HasPrefix(path, "/api/") {
 		handleAPI(w, r)
@@ -70,11 +81,49 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	// Static pages - menggunakan handler baru yang modular
 	switch path {
 	case "/", "/home":
+		// Check SSO callback dari Keycloak (Authorization Code Flow)
+		// Format: /?code=<authorization_code>&state=<state_token>
+		// Keycloak akan redirect user ke website ini dengan authorization code
+		code := r.URL.Query().Get("code")
+		state := r.URL.Query().Get("state")
+		errorParam := r.URL.Query().Get("error")
+
+		// Juga support format lama (sso_token) untuk backward compatibility
+		ssoToken := r.URL.Query().Get("sso_token")
+
+		// Jika ada authorization code, state, atau error dari Keycloak, redirect ke login dengan semua query parameters
+		if code != "" || state != "" || errorParam != "" || ssoToken != "" {
+			// Pastikan semua query parameters dibawa saat redirect ke login
+			// Login page sudah include sso-handler.js yang akan auto-process code/token dan login user
+			queryString := r.URL.RawQuery
+			if queryString != "" {
+				redirectURL := "/login?" + queryString
+				log.Printf("🔐 SSO callback detected (code=%s, state=%s), redirecting to: %s",
+					func() string {
+						if len(code) > 10 {
+							return code[:10] + "..."
+						}
+						return code
+					}(),
+					func() string {
+						if len(state) > 10 {
+							return state[:10] + "..."
+						}
+						return state
+					}(),
+					redirectURL)
+				http.Redirect(w, r, redirectURL, http.StatusSeeOther)
+			} else {
+				// Fallback jika RawQuery kosong (tidak seharusnya terjadi)
+				log.Printf("⚠️ WARNING: SSO callback detected but RawQuery is empty")
+				http.Redirect(w, r, "/login", http.StatusSeeOther)
+			}
+			return
+		}
+
 		// Check if authenticated
-		// PENTING: Jangan auto-login dari SSO tanpa explicit consent!
-		// User harus explicitly klik "Login dengan SSO" dan authorize aplikasi
-		// Ini sesuai dengan OAuth 2.0 Authorization Code Flow best practices
 		if !isAuthenticated(r) {
+			// Redirect ke login tanpa next param untuk menghindari loop
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
@@ -174,6 +223,12 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 		handleGetNewsAPI(w, r)
 	case path == "/api/announcements" && method == "GET":
 		handleGetAnnouncementsAPI(w, r)
+	case path == "/api/users/sso-login" && method == "POST":
+		// Endpoint untuk check atau create user dari SSO Keycloak
+		handleSSOUserLoginAPI(w, r)
+	case path == "/api/auth/sso-login" && method == "POST":
+		// Endpoint untuk create session aplikasi setelah SSO login
+		handleSSOAuthLoginAPI(w, r)
 	default:
 		helpers.WriteError(w, http.StatusNotFound, "Endpoint not found")
 	}
@@ -477,63 +532,154 @@ func LoginPostHandler(w http.ResponseWriter, r *http.Request) {
 // RequireAuth adalah middleware untuk protect routes
 // Cek apakah user memiliki access token ATAU session yang valid
 // Support kedua metode: SSO (access token) dan direct login (session)
+// func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
+// 	return func(w http.ResponseWriter, r *http.Request) {
+// 		// Cek 1: Access token dari SSO (prioritas pertama)
+// 		accessToken, err := helpers.GetCookie(r, "sso_access_token")
+// 		if err == nil && accessToken != "" {
+// 			// Cek token expiration
+// 			tokenExpiresStr, err := helpers.GetCookie(r, "sso_token_expires")
+// 			if err == nil && tokenExpiresStr != "" {
+// 				tokenExpires, err := strconv.ParseInt(tokenExpiresStr, 10, 64)
+// 				if err == nil && time.Now().Unix() <= tokenExpires {
+// 					// Access token valid, lanjutkan
+// 					log.Printf("✅ Access token valid")
+// 					next(w, r)
+// 					return
+// 				}
+// 			}
+// 			// Token expired atau invalid, clear cookies
+// 			log.Printf("WARNING: Access token expired or invalid, clearing cookies")
+// 			helpers.ClearCookie(w, r, "sso_access_token")
+// 			helpers.ClearCookie(w, r, "sso_token_expires")
+// 		}
+
+// 		// Cek 2: Session dari direct login (fallback)
+// 		// PENTING: Hanya gunakan cookie client_dinas_session, JANGAN gunakan sso_admin_session dari SSO server
+// 		sessionID, err := helpers.GetCookie(r, "client_dinas_session")
+// 		if err != nil {
+// 			// Fallback ke session_id untuk backward compatibility (cookie lama dari direct login)
+// 			sessionID, err = helpers.GetCookie(r, "session_id")
+// 		}
+// 		if err == nil && sessionID != "" {
+// 			userID, ok, err := session.ValidateSession(sessionID)
+// 			if ok && err == nil && userID != "" {
+// 				// Session valid, lanjutkan
+// 				log.Printf("✅ Session valid for user: %s", userID)
+// 				next(w, r)
+// 				return
+// 			}
+// 			// Session invalid, clear cookie
+// 			if !ok {
+// 				log.Printf("WARNING: Session invalid, clearing cookie")
+// 				helpers.ClearCookie(w, r, "client_dinas_session")
+// 				helpers.ClearCookie(w, r, "session_id") // Clear juga untuk backward compatibility
+// 			}
+// 		}
+
+// 		// Tidak ada token atau session yang valid, redirect ke login
+// 		// JANGAN tambahkan error=no_token untuk menghindari redirect loop
+// 		currentPath := r.URL.Path
+
+// 		// Skip redirect untuk static files, API, dan favicon
+// 		if strings.HasPrefix(currentPath, "/static/") ||
+// 			strings.HasPrefix(currentPath, "/api/") ||
+// 			currentPath == "/favicon.ico" ||
+// 			currentPath == "/logo.png" ||
+// 			currentPath == "/login" ||
+// 			currentPath == "/register" {
+// 			// Route ini tidak perlu auth, langsung return 404 atau biarkan handler lain handle
+// 			http.NotFound(w, r)
+// 			return
+// 		}
+
+// 		// Redirect ke login dengan next param
+// 		// Hanya tambahkan next jika path bukan / (root)
+// 		redirectURL := "/login"
+// 		if currentPath != "/" {
+// 			redirectURL = "/login?next=" + helpers.SanitizeInput(currentPath)
+// 		}
+
+// 		log.Printf("WARNING: No valid auth found for path %s, redirecting to: %s", currentPath, redirectURL)
+// 		http.Redirect(w, r, redirectURL, http.StatusSeeOther)
+// 	}
+// }
+
+// RequireAuth middleware — perbaikan
 func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Cek 1: Access token dari SSO (prioritas pertama)
-		accessToken, err := helpers.GetCookie(r, "sso_access_token")
-		if err == nil && accessToken != "" {
-			// Cek token expiration
-			tokenExpiresStr, err := helpers.GetCookie(r, "sso_token_expires")
-			if err == nil && tokenExpiresStr != "" {
-				tokenExpires, err := strconv.ParseInt(tokenExpiresStr, 10, 64)
-				if err == nil && time.Now().Unix() <= tokenExpires {
-					// Access token valid, lanjutkan
-					log.Printf("✅ Access token valid")
-					next(w, r)
-					return
+		// Normalisasi path (hilangkan trailing slash kecuali root)
+		currentPath := r.URL.Path
+		if len(currentPath) > 1 && strings.HasSuffix(currentPath, "/") {
+			currentPath = strings.TrimRight(currentPath, "/")
+		}
+
+		// 1) Cek SSO access token
+		if accessToken, err := helpers.GetCookie(r, "sso_access_token"); err == nil && accessToken != "" {
+			if tokenExpiresStr, err := helpers.GetCookie(r, "sso_token_expires"); err == nil && tokenExpiresStr != "" {
+				if tokenExpires, err := strconv.ParseInt(tokenExpiresStr, 10, 64); err == nil {
+					if time.Now().Unix() <= tokenExpires {
+						log.Printf("✅ Access token valid")
+						next(w, r)
+						return
+					}
 				}
 			}
-			// Token expired atau invalid, clear cookies
 			log.Printf("WARNING: Access token expired or invalid, clearing cookies")
 			helpers.ClearCookie(w, r, "sso_access_token")
 			helpers.ClearCookie(w, r, "sso_token_expires")
 		}
 
-		// Cek 2: Session dari direct login (fallback)
-		// PENTING: Hanya gunakan cookie client_dinas_session, JANGAN gunakan sso_admin_session dari SSO server
+		// 2) Cek session dari direct login (fallback)
 		sessionID, err := helpers.GetCookie(r, "client_dinas_session")
-		if err != nil {
-			// Fallback ke session_id untuk backward compatibility (cookie lama dari direct login)
-			sessionID, err = helpers.GetCookie(r, "session_id")
+		if err != nil || sessionID == "" {
+			sessionID, err = helpers.GetCookie(r, "session_id") // backward compat
 		}
 		if err == nil && sessionID != "" {
 			userID, ok, err := session.ValidateSession(sessionID)
 			if ok && err == nil && userID != "" {
-				// Session valid, lanjutkan
 				log.Printf("✅ Session valid for user: %s", userID)
 				next(w, r)
 				return
 			}
-			// Session invalid, clear cookie
+			// invalid => clear
 			if !ok {
 				log.Printf("WARNING: Session invalid, clearing cookie")
 				helpers.ClearCookie(w, r, "client_dinas_session")
-				helpers.ClearCookie(w, r, "session_id") // Clear juga untuk backward compatibility
+				helpers.ClearCookie(w, r, "session_id")
 			}
 		}
 
-		// Tidak ada token atau session yang valid, redirect ke login
-		// JANGAN tambahkan error=no_token untuk menghindari redirect loop
-		// Jika sudah ada error di URL, jangan tambahkan lagi
-		nextParam := r.URL.Query().Get("next")
-		if nextParam == "" {
-			nextParam = r.URL.Path
+		// --- PUBLIC ROUTES (DO NOT PROTECT) ---
+		// PENTING: Cek ini HARUS dilakukan SEBELUM redirect untuk menghindari loop
+		// Route ini tidak perlu auth, biarkan handler yang bertanggung jawab handle
+		if strings.HasPrefix(currentPath, "/static/") ||
+			strings.HasPrefix(currentPath, "/api/") ||
+			strings.HasPrefix(currentPath, "/login") || // covers /login and /login/...
+			strings.HasPrefix(currentPath, "/register") ||
+			currentPath == "/favicon.ico" ||
+			currentPath == "/logo.png" {
+			next(w, r)
+			return
 		}
+
+		// Tidak ada auth valid: redirect ke login
+		// Cek apakah sudah ada next param di URL untuk menghindari loop
+		existingNext := r.URL.Query().Get("next")
+		if existingNext != "" && existingNext == currentPath {
+			// Sudah redirect dengan next param yang sama, break loop
+			log.Printf("WARNING: Redirect loop detected for path %s, breaking loop", currentPath)
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+
 		redirectURL := "/login"
-		if nextParam != "" && nextParam != "/login" {
-			redirectURL = "/login?next=" + helpers.SanitizeInput(nextParam)
+		if currentPath != "/" {
+			// escape path supaya aman (hindari open redirect / karakter aneh)
+			redirectURL = "/login?next=" + url.QueryEscape(currentPath)
 		}
-		log.Printf("WARNING: No valid auth found, redirecting to: %s", redirectURL)
+
+		log.Printf("WARNING: No valid auth found for path %s, redirecting to: %s", currentPath, redirectURL)
 		http.Redirect(w, r, redirectURL, http.StatusSeeOther)
 	}
 }
@@ -824,10 +970,64 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
         .btn-logout:hover {
             background: #dc2626;
         }
+        .sso-info-card {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 24px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .sso-info-title {
+            font-size: 20px;
+            font-weight: 600;
+            color: #1e293b;
+            margin-bottom: 16px;
+        }
+        .sso-info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+        }
+        .sso-info-item {
+            display: flex;
+            flex-direction: column;
+        }
+        .sso-info-label {
+            color: #64748b;
+            font-size: 12px;
+            font-weight: 500;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+        .sso-info-value {
+            color: #1e293b;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        .sso-info-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .sso-info-badge.verified {
+            background: #d1fae5;
+            color: #065f46;
+        }
+        .sso-info-badge.user {
+            background: #dbeafe;
+            color: #1e40af;
+        }
+        .sso-info-badge.admin {
+            background: #fef3c7;
+            color: #92400e;
+        }
         @media (max-width: 768px) {
             .container { padding: 16px; }
             .welcome-section { padding: 24px; }
             .stats-grid { grid-template-columns: 1fr; }
+            .sso-info-grid { grid-template-columns: 1fr; }
         }
     </style>
 </head>
@@ -849,6 +1049,12 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
         <div class="welcome-section">
             <h1 class="welcome-title">Selamat Datang, %s!</h1>
             <p class="welcome-subtitle">Dashboard Sistem Informasi Dinas Pendidikan</p>
+        </div>
+        <div id="ssoInfoCard" class="sso-info-card" style="display: none;">
+            <h2 class="sso-info-title">📋 Informasi SSO User</h2>
+            <div class="sso-info-grid" id="ssoInfoGrid">
+                <!-- Data akan diisi oleh JavaScript -->
+            </div>
         </div>
         <div class="stats-grid">
             <div class="stat-card">
@@ -887,6 +1093,85 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
             </a>
         </div>
     </div>
+    <script>
+        // Tampilkan data SSO User Info dari sessionStorage
+        function displaySSOUserInfo() {
+            try {
+                const ssoUserInfoStr = sessionStorage.getItem('sso_user_info');
+                if (!ssoUserInfoStr) {
+                    console.log('No SSO user info found in sessionStorage');
+                    return;
+                }
+                
+                const ssoUserInfo = JSON.parse(ssoUserInfoStr);
+                const card = document.getElementById('ssoInfoCard');
+                const grid = document.getElementById('ssoInfoGrid');
+                
+                if (!card || !grid) return;
+                
+                // Tampilkan card
+                card.style.display = 'block';
+                
+                // Clear existing content
+                grid.innerHTML = '';
+                
+                // Helper function untuk membuat info item
+                function createInfoItem(label, value, badgeClass) {
+                    const item = document.createElement('div');
+                    item.className = 'sso-info-item';
+                    
+                    const labelEl = document.createElement('div');
+                    labelEl.className = 'sso-info-label';
+                    labelEl.textContent = label;
+                    
+                    const valueEl = document.createElement('div');
+                    valueEl.className = 'sso-info-value';
+                    
+                    if (badgeClass) {
+                        const badge = document.createElement('span');
+                        badge.className = 'sso-info-badge ' + badgeClass;
+                        badge.textContent = value;
+                        valueEl.appendChild(badge);
+                    } else {
+                        valueEl.textContent = value || '-';
+                    }
+                    
+                    item.appendChild(labelEl);
+                    item.appendChild(valueEl);
+                    return item;
+                }
+                
+                // Tampilkan data
+                if (ssoUserInfo.id_user) {
+                    grid.appendChild(createInfoItem('ID User', ssoUserInfo.id_user));
+                }
+                if (ssoUserInfo.email) {
+                    grid.appendChild(createInfoItem('Email', ssoUserInfo.email));
+                }
+                if (ssoUserInfo.name) {
+                    grid.appendChild(createInfoItem('Nama', ssoUserInfo.name));
+                }
+                if (ssoUserInfo.preferred_username) {
+                    grid.appendChild(createInfoItem('Username', ssoUserInfo.preferred_username));
+                }
+                if (ssoUserInfo.email_verified !== undefined) {
+                    grid.appendChild(createInfoItem('Email Verified', ssoUserInfo.email_verified ? 'Verified' : 'Not Verified', 
+                        ssoUserInfo.email_verified ? 'verified' : ''));
+                }
+                if (ssoUserInfo.peran) {
+                    const peranClass = ssoUserInfo.peran === 'admin' ? 'admin' : 'user';
+                    grid.appendChild(createInfoItem('Peran', ssoUserInfo.peran, peranClass));
+                }
+                
+                console.log('✅ SSO User Info displayed:', ssoUserInfo);
+            } catch (error) {
+                console.error('Error displaying SSO user info:', error);
+            }
+        }
+        
+        // Jalankan saat page load
+        document.addEventListener('DOMContentLoaded', displaySSOUserInfo);
+    </script>
 </body>
 </html>`, logoBase64, string([]rune(userName)[0]), userName, userName, counts["pengguna"], counts["aplikasi"], counts["sessions"], counts["tokens"])
 
@@ -2426,8 +2711,119 @@ func LogoutHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("✅ All auth cookies cleared, user logged out")
 
-	// Redirect ke home
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	// Render halaman logout yang akan clear localStorage sebelum redirect
+	// PENTING: Hapus app_session_token dari localStorage untuk mencegah redirect loop
+	renderLogoutPage(w)
+}
+
+// renderLogoutPage menampilkan halaman logout yang akan clear localStorage dan sessionStorage
+// sebelum redirect ke halaman login
+func renderLogoutPage(w http.ResponseWriter) {
+	logoBase64 := base64.StdEncoding.EncodeToString(LogoData)
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Logout - Dinas Pendidikan DKI Jakarta</title>
+    <link rel="icon" type="image/png" href="/logo.png">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .logout-container {
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            width: 100%%;
+            max-width: 400px;
+            padding: 40px;
+            text-align: center;
+        }
+        .logo {
+            margin-bottom: 24px;
+        }
+        .logo img {
+            height: 48px;
+            margin-bottom: 16px;
+        }
+        .logo h1 {
+            color: #1e293b;
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .logo p {
+            color: #64748b;
+            font-size: 14px;
+        }
+        .message {
+            color: #334155;
+            font-size: 16px;
+            margin-bottom: 24px;
+        }
+        .spinner {
+            border: 3px solid #f3f4f6;
+            border-top: 3px solid #6366f1;
+            border-radius: 50%%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 16px;
+        }
+        @keyframes spin {
+            0%% { transform: rotate(0deg); }
+            100%% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="logout-container">
+        <div class="logo">
+            <img src="data:image/png;base64,%s" alt="Logo Dinas Pendidikan">
+            <h1>Dinas Pendidikan</h1>
+            <p>Provinsi DKI Jakarta</p>
+        </div>
+        <div class="spinner"></div>
+        <p class="message">Sedang keluar dari sistem...</p>
+    </div>
+    <script>
+        // Clear semua data dari localStorage dan sessionStorage
+        // PENTING: Hapus app_session_token untuk mencegah redirect loop
+        try {
+            // Clear localStorage
+            localStorage.removeItem('app_session_token');
+            localStorage.removeItem('user');
+            console.log('✅ localStorage cleared');
+            
+            // Clear sessionStorage
+            sessionStorage.removeItem('sso_access_token');
+            sessionStorage.removeItem('sso_id_token');
+            sessionStorage.removeItem('sso_user_info');
+            sessionStorage.removeItem('redirect_after_login');
+            console.log('✅ sessionStorage cleared');
+        } catch (error) {
+            console.error('Error clearing storage:', error);
+        }
+        
+        // Redirect ke login setelah 500ms
+        setTimeout(() => {
+            window.location.href = '/login';
+        }, 500);
+    </script>
+</body>
+</html>`, logoBase64)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(html))
 }
 
 // checkSSOSession checks if user has valid SSO session and creates local session
@@ -3623,6 +4019,311 @@ func handleGetAnnouncementsAPI(w http.ResponseWriter, r *http.Request) {
 	helpers.WriteSuccess(w, "Pengumuman retrieved", announcements)
 }
 
+// ============================================
+// SSO KEYCLOAK HANDLERS
+// ============================================
+// Semua handler SSO Keycloak ada di section ini untuk memudahkan pencarian
+// File: api/main_handler.go
+
+// handleSSOUserLoginAPI - Endpoint POST /api/users/sso-login
+// Check atau create user di database berdasarkan data dari SSO Keycloak
+// Request body: { "email": "...", "name": "...", "keycloak_id": "..." }
+// Headers: Authorization: Bearer <sso_access_token>
+// Response: { "user": { "id": "...", "email": "...", "name": "...", "keycloak_id": "..." } }
+func handleSSOUserLoginAPI(w http.ResponseWriter, r *http.Request) {
+	// Verify Authorization header
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+		helpers.WriteError(w, http.StatusUnauthorized, "Authorization header required")
+		return
+	}
+
+	// Parse request body
+	var req struct {
+		Email      string `json:"email"`
+		Name       string `json:"name"`
+		KeycloakID string `json:"keycloak_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("ERROR parsing request body: %v", err)
+		helpers.WriteError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	// Validate required fields
+	if req.Email == "" {
+		helpers.WriteError(w, http.StatusBadRequest, "Email is required")
+		return
+	}
+
+	if req.KeycloakID == "" {
+		helpers.WriteError(w, http.StatusBadRequest, "keycloak_id is required")
+		return
+	}
+
+	supabaseURL := getSupabaseURL()
+	supabaseKey := getSupabaseKey()
+	if supabaseURL == "" || supabaseKey == "" {
+		helpers.WriteError(w, http.StatusInternalServerError, "Database configuration error")
+		return
+	}
+
+	// Check if user exists by email
+	// Note: Jika ada kolom keycloak_id di tabel pengguna, bisa tambahkan query OR keycloak_id = ?
+	emailEncoded := url.QueryEscape(req.Email)
+
+	// Cek berdasarkan email
+	apiURL := fmt.Sprintf("%s/rest/v1/pengguna?email=eq.%s&select=*", supabaseURL, emailEncoded)
+
+	httpReq, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		log.Printf("ERROR creating request: %v", err)
+		helpers.WriteError(w, http.StatusInternalServerError, "Failed to query database")
+		return
+	}
+
+	httpReq.Header.Set("apikey", supabaseKey)
+	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		log.Printf("ERROR calling Supabase: %v", err)
+		helpers.WriteError(w, http.StatusInternalServerError, "Failed to connect to database")
+		return
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	var users []map[string]interface{}
+
+	if resp.StatusCode == http.StatusOK {
+		if err := json.Unmarshal(bodyBytes, &users); err != nil {
+			log.Printf("ERROR parsing response: %v", err)
+			helpers.WriteError(w, http.StatusInternalServerError, "Failed to parse response")
+			return
+		}
+	}
+
+	var user map[string]interface{}
+
+	// Jika user tidak ditemukan, create user baru
+	if len(users) == 0 {
+		log.Printf("User tidak ditemukan, membuat user baru: %s", req.Email)
+
+		// Prepare user data
+		// Schema: id_pengguna (PK), email, password, nama_lengkap, peran, aktif
+		// Untuk SSO user, kita set password kosong atau random (karena login via SSO)
+		// Peran default: "user" (bisa diubah sesuai kebutuhan)
+		userData := map[string]interface{}{
+			"email":        req.Email,
+			"nama_lengkap": req.Name,
+			"peran":        "user", // Default role, bisa diubah sesuai kebutuhan
+			"aktif":        true,
+			// Note: Jika ada kolom keycloak_id di schema, tambahkan:
+			// "keycloak_id": req.KeycloakID,
+		}
+
+		// Set password default (random) untuk SSO user
+		// User SSO tidak akan login dengan password, tapi tetap perlu kolom password
+		defaultPassword := "sso_user_" + req.KeycloakID // Placeholder, tidak akan digunakan
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(defaultPassword), bcrypt.DefaultCost)
+		if err != nil {
+			log.Printf("ERROR hashing password: %v", err)
+			helpers.WriteError(w, http.StatusInternalServerError, "Failed to create user")
+			return
+		}
+		userData["password"] = string(hashedPassword)
+
+		// Create user di Supabase
+		userJSON, _ := json.Marshal(userData)
+		createURL := fmt.Sprintf("%s/rest/v1/pengguna", supabaseURL)
+		createReq, err := http.NewRequest("POST", createURL, bytes.NewBuffer(userJSON))
+		if err != nil {
+			log.Printf("ERROR creating request: %v", err)
+			helpers.WriteError(w, http.StatusInternalServerError, "Failed to create user")
+			return
+		}
+
+		createReq.Header.Set("apikey", supabaseKey)
+		createReq.Header.Set("Authorization", "Bearer "+supabaseKey)
+		createReq.Header.Set("Content-Type", "application/json")
+		createReq.Header.Set("Prefer", "return=representation")
+
+		createResp, err := http.DefaultClient.Do(createReq)
+		if err != nil {
+			log.Printf("ERROR calling Supabase: %v", err)
+			helpers.WriteError(w, http.StatusInternalServerError, "Failed to create user")
+			return
+		}
+		defer createResp.Body.Close()
+
+		createBodyBytes, _ := io.ReadAll(createResp.Body)
+		if createResp.StatusCode != http.StatusOK && createResp.StatusCode != http.StatusCreated {
+			log.Printf("ERROR Supabase response: Status %d, Body: %s", createResp.StatusCode, string(createBodyBytes))
+			helpers.WriteError(w, http.StatusInternalServerError, "Failed to create user")
+			return
+		}
+
+		var newUsers []map[string]interface{}
+		if err := json.Unmarshal(createBodyBytes, &newUsers); err != nil {
+			log.Printf("ERROR parsing response: %v", err)
+			helpers.WriteError(w, http.StatusInternalServerError, "Failed to parse response")
+			return
+		}
+
+		if len(newUsers) == 0 {
+			helpers.WriteError(w, http.StatusInternalServerError, "Failed to create user")
+			return
+		}
+
+		user = newUsers[0]
+		log.Printf("✅ User created: %s", req.Email)
+	} else {
+		// User sudah ada
+		user = users[0]
+		log.Printf("✅ User found: %s", req.Email)
+	}
+
+	// Extract user ID (bisa id_pengguna atau id)
+	userID := ""
+	if idPengguna, ok := user["id_pengguna"].(string); ok {
+		userID = idPengguna
+	} else if id, ok := user["id"].(string); ok {
+		userID = id
+	} else {
+		userID = fmt.Sprintf("%v", user["id_pengguna"])
+	}
+
+	// Return user data
+	response := map[string]interface{}{
+		"user": map[string]interface{}{
+			"id":          userID,
+			"email":       user["email"],
+			"name":        user["nama_lengkap"],
+			"keycloak_id": req.KeycloakID,
+		},
+	}
+
+	helpers.WriteJSON(w, http.StatusOK, response)
+}
+
+// handleSSOAuthLoginAPI - Endpoint POST /api/auth/sso-login
+// Create session aplikasi setelah user berhasil login via SSO
+// Request body: { "email": "...", "keycloak_id": "..." }
+// Headers: Authorization: Bearer <sso_access_token>
+// Response: { "session_token": "...", "user": { ... } }
+func handleSSOAuthLoginAPI(w http.ResponseWriter, r *http.Request) {
+	// Verify Authorization header
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+		helpers.WriteError(w, http.StatusUnauthorized, "Authorization header required")
+		return
+	}
+
+	// Parse request body
+	var req struct {
+		Email      string `json:"email"`
+		KeycloakID string `json:"keycloak_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("ERROR parsing request body: %v", err)
+		helpers.WriteError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	// Validate required fields
+	if req.Email == "" {
+		helpers.WriteError(w, http.StatusBadRequest, "Email is required")
+		return
+	}
+
+	supabaseURL := getSupabaseURL()
+	supabaseKey := getSupabaseKey()
+	if supabaseURL == "" || supabaseKey == "" {
+		helpers.WriteError(w, http.StatusInternalServerError, "Database configuration error")
+		return
+	}
+
+	// Get user by email
+	emailEncoded := url.QueryEscape(req.Email)
+	apiURL := fmt.Sprintf("%s/rest/v1/pengguna?email=eq.%s&select=*", supabaseURL, emailEncoded)
+
+	httpReq, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		log.Printf("ERROR creating request: %v", err)
+		helpers.WriteError(w, http.StatusInternalServerError, "Failed to query database")
+		return
+	}
+
+	httpReq.Header.Set("apikey", supabaseKey)
+	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		log.Printf("ERROR calling Supabase: %v", err)
+		helpers.WriteError(w, http.StatusInternalServerError, "Failed to connect to database")
+		return
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	var users []map[string]interface{}
+
+	if resp.StatusCode == http.StatusOK {
+		if err := json.Unmarshal(bodyBytes, &users); err != nil {
+			log.Printf("ERROR parsing response: %v", err)
+			helpers.WriteError(w, http.StatusInternalServerError, "Failed to parse response")
+			return
+		}
+	}
+
+	if len(users) == 0 {
+		helpers.WriteError(w, http.StatusNotFound, "User not found")
+		return
+	}
+
+	user := users[0]
+
+	// Extract user ID
+	userID := ""
+	if idPengguna, ok := user["id_pengguna"].(string); ok {
+		userID = idPengguna
+	} else if id, ok := user["id"].(string); ok {
+		userID = id
+	} else {
+		userID = fmt.Sprintf("%v", user["id_pengguna"])
+	}
+
+	// Create session
+	sessionID, err := session.CreateSession(userID, r)
+	if err != nil {
+		log.Printf("ERROR creating session: %v", err)
+		helpers.WriteError(w, http.StatusInternalServerError, "Failed to create session")
+		return
+	}
+
+	// Set cookie
+	helpers.SetCookie(w, r, "client_dinas_session", sessionID, 86400) // 24 jam
+
+	log.Printf("✅ SSO session created: %s for user: %s", sessionID, req.Email)
+
+	// Return response
+	response := map[string]interface{}{
+		"session_token": sessionID,
+		"user": map[string]interface{}{
+			"id":    userID,
+			"email": user["email"],
+			"name":  user["nama_lengkap"],
+		},
+	}
+
+	helpers.WriteJSON(w, http.StatusOK, response)
+}
+
 // Helper functions
 func getIPAddress(r *http.Request) string {
 	ip := r.Header.Get("X-Forwarded-For")
@@ -3959,48 +4660,6 @@ func renderLoginPage(w http.ResponseWriter, errorMsg, email string) {
         .link-text a:hover {
             text-decoration: underline;
         }
-        .divider {
-            display: flex;
-            align-items: center;
-            margin: 24px 0;
-            color: #94a3b8;
-            font-size: 14px;
-        }
-        .divider::before,
-        .divider::after {
-            content: '';
-            flex: 1;
-            height: 1px;
-            background: #e2e8f0;
-        }
-        .divider span {
-            padding: 0 16px;
-        }
-        .btn-sso {
-            width: 100%%;
-            padding: 14px;
-            background: white;
-            color: #1e293b;
-            border: 2px solid #e2e8f0;
-            border-radius: 8px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-            text-decoration: none;
-        }
-        .btn-sso:hover {
-            border-color: #6366f1;
-            background: #f8fafc;
-        }
-        .btn-sso svg {
-            width: 20px;
-            height: 20px;
-        }
     </style>
 </head>
 <body>
@@ -4032,9 +4691,6 @@ func renderLoginPage(w http.ResponseWriter, errorMsg, email string) {
             </div>
             <button type="submit" class="btn-primary" id="submitBtn">Masuk</button>
         </form>
-        <div class="divider">
-            <span>atau</span>
-        </div>
         <div class="link-text">
             Belum punya akun? <a href="/register">Daftar di sini</a>
         </div>
@@ -4116,6 +4772,8 @@ func renderLoginPage(w http.ResponseWriter, errorMsg, email string) {
         });
         %s
     </script>
+    <!-- SSO Keycloak Handler -->
+    <script src="/static/sso-handler.js"></script>
 </body>
 </html>`, logoBase64, email, func() string {
 		if errorMsg != "" {
