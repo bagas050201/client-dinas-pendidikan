@@ -1056,24 +1056,6 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
                 <!-- Data akan diisi oleh JavaScript -->
             </div>
         </div>
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-label">Total Pengguna</div>
-                <div class="stat-value">%d</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Aplikasi Terhubung</div>
-                <div class="stat-value">%d</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Sessions Aktif</div>
-                <div class="stat-value">%d</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Tokens</div>
-                <div class="stat-value">%d</div>
-            </div>
-        </div>
         <div class="actions-grid">
             <a href="/info-dinas" class="action-card">
                 <div class="action-title">📋 Informasi Dinas</div>
@@ -1094,6 +1076,43 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
         </div>
     </div>
     <script>
+        // Update header dan welcome message dengan data SSO dari sessionStorage
+        function updateUserDisplayFromSSO() {
+            try {
+                const ssoUserInfoStr = sessionStorage.getItem('sso_user_info');
+                if (!ssoUserInfoStr) {
+                    console.log('No SSO user info found in sessionStorage, using server data');
+                    return;
+                }
+                
+                const ssoUserInfo = JSON.parse(ssoUserInfoStr);
+                
+                // Update nama di header (navbar)
+                const userNameSpan = document.querySelector('.user-menu span');
+                if (userNameSpan && ssoUserInfo.name) {
+                    userNameSpan.textContent = ssoUserInfo.name;
+                    console.log('✅ Updated header name to:', ssoUserInfo.name);
+                }
+                
+                // Update avatar initial
+                const userAvatar = document.querySelector('.user-avatar');
+                if (userAvatar && ssoUserInfo.name) {
+                    const initial = ssoUserInfo.name.charAt(0).toUpperCase();
+                    userAvatar.textContent = initial;
+                    console.log('✅ Updated avatar initial to:', initial);
+                }
+                
+                // Update welcome message
+                const welcomeTitle = document.querySelector('.welcome-title');
+                if (welcomeTitle && ssoUserInfo.name) {
+                    welcomeTitle.textContent = 'Selamat Datang, ' + ssoUserInfo.name + '!';
+                    console.log('✅ Updated welcome message to:', ssoUserInfo.name);
+                }
+            } catch (error) {
+                console.error('Error updating user display from SSO:', error);
+            }
+        }
+        
         // Tampilkan data SSO User Info dari sessionStorage
         function displaySSOUserInfo() {
             try {
@@ -1170,10 +1189,15 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
         }
         
         // Jalankan saat page load
-        document.addEventListener('DOMContentLoaded', displaySSOUserInfo);
+        document.addEventListener('DOMContentLoaded', function() {
+            // Update header dan welcome message terlebih dahulu
+            updateUserDisplayFromSSO();
+            // Tampilkan SSO info card
+            displaySSOUserInfo();
+        });
     </script>
 </body>
-</html>`, logoBase64, string([]rune(userName)[0]), userName, userName, counts["pengguna"], counts["aplikasi"], counts["sessions"], counts["tokens"])
+</html>`, logoBase64, string([]rune(userName)[0]), userName, userName)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -1328,43 +1352,6 @@ func getDemoDataSekolah() []map[string]interface{} {
 // renderInfoDinasPage menampilkan halaman Informasi Dinas
 func renderInfoDinasPage(w http.ResponseWriter, apps []map[string]interface{}, schools []map[string]interface{}) {
 	logoBase64 := base64.StdEncoding.EncodeToString(LogoData)
-
-	// Generate HTML untuk aplikasi terhubung
-	appsHTML := ""
-	if len(apps) > 0 {
-		for _, app := range apps {
-			nama := fmt.Sprintf("%v", app["nama"])
-			deskripsi := fmt.Sprintf("%v", app["deskripsi"])
-			link := fmt.Sprintf("%v", app["link_akses"])
-			if link == "" {
-				link = "#"
-			}
-			appsHTML += fmt.Sprintf(`
-            <div class="app-card">
-                <h3>%s</h3>
-                <p>%s</p>
-                <a href="%s" class="app-link" target="_blank">Akses Aplikasi →</a>
-            </div>`, nama, deskripsi, link)
-		}
-	} else {
-		// Demo apps jika tidak ada data
-		appsHTML = `
-            <div class="app-card">
-                <h3>Sistem Informasi Akademik</h3>
-                <p>Platform untuk mengelola data akademik siswa dan guru</p>
-                <a href="#" class="app-link">Akses Aplikasi →</a>
-            </div>
-            <div class="app-card">
-                <h3>Portal PPDB Online</h3>
-                <p>Sistem pendaftaran peserta didik baru secara online</p>
-                <a href="#" class="app-link">Akses Aplikasi →</a>
-            </div>
-            <div class="app-card">
-                <h3>E-Learning Platform</h3>
-                <p>Platform pembelajaran daring untuk siswa dan guru</p>
-                <a href="#" class="app-link">Akses Aplikasi →</a>
-            </div>`
-	}
 
 	// Generate HTML untuk data sekolah
 	schoolsHTML := ""
@@ -1576,13 +1563,6 @@ func renderInfoDinasPage(w http.ResponseWriter, apps []map[string]interface{}, s
         </div>
 
         <div class="section">
-            <h2 class="section-title">Aplikasi Terhubung</h2>
-            <div class="apps-grid">
-                %s
-            </div>
-        </div>
-
-        <div class="section">
             <h2 class="section-title">Tentang Dinas</h2>
             <div class="about-content">
                 <p>
@@ -1613,7 +1593,7 @@ func renderInfoDinasPage(w http.ResponseWriter, apps []map[string]interface{}, s
         </div>
     </div>
 </body>
-</html>`, logoBase64, appsHTML, schoolsHTML)
+</html>`, logoBase64, schoolsHTML)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -2658,6 +2638,28 @@ func renderProfilePageNew(w http.ResponseWriter, user map[string]interface{}) {
         </div>
     </div>
     <script>
+        // Update form dengan data dari sessionStorage SSO jika tersedia
+        (function() {
+            try {
+                const ssoUserInfoStr = sessionStorage.getItem('sso_user_info');
+                if (ssoUserInfoStr) {
+                    const ssoUserInfo = JSON.parse(ssoUserInfoStr);
+                    const namaInput = document.getElementById('nama_lengkap');
+                    const emailInput = document.getElementById('email');
+                    
+                    if (namaInput && ssoUserInfo.name && !namaInput.value) {
+                        namaInput.value = ssoUserInfo.name;
+                    }
+                    if (emailInput && ssoUserInfo.email && !emailInput.value) {
+                        emailInput.value = ssoUserInfo.email;
+                    }
+                    console.log('✅ Updated profile form from SSO data');
+                }
+            } catch (error) {
+                console.error('Error updating profile form from SSO:', error);
+            }
+        })();
+        
         // Tampilkan success message jika ada parameter success
         const urlParams = new URLSearchParams(window.location.search);
         if (urlParams.get('success') === '1') {
@@ -5102,12 +5104,30 @@ func getCommonHeader(user map[string]interface{}) string {
             <a href="/services" style="text-decoration: none; color: #334155; font-weight: 500; font-size: 14px;">Layanan</a>
             <a href="/news" style="text-decoration: none; color: #334155; font-weight: 500; font-size: 14px;">Berita</a>
             <div style="display: flex; align-items: center; gap: 12px; padding-left: 24px; border-left: 1px solid #e2e8f0;">
-                <span style="color: #64748b; font-size: 14px;">%s</span>
+                <span id="headerUserName" style="color: #64748b; font-size: 14px;">%s</span>
                 <a href="/profile" style="text-decoration: none; color: #6366f1; font-weight: 500; font-size: 14px;">Profile</a>
                 <a href="/logout" style="text-decoration: none; color: #dc2626; font-weight: 500; font-size: 14px;">Keluar</a>
             </div>
         </div>
     </nav>
+    <script>
+        // Update header dengan data dari sessionStorage SSO jika tersedia
+        (function() {
+            try {
+                const ssoUserInfoStr = sessionStorage.getItem('sso_user_info');
+                if (ssoUserInfoStr) {
+                    const ssoUserInfo = JSON.parse(ssoUserInfoStr);
+                    const userNameSpan = document.getElementById('headerUserName');
+                    if (userNameSpan && ssoUserInfo.name) {
+                        userNameSpan.textContent = ssoUserInfo.name;
+                        console.log('✅ Updated header name from SSO:', ssoUserInfo.name);
+                    }
+                }
+            } catch (error) {
+                console.error('Error updating header from SSO:', error);
+            }
+        })();
+    </script>
 </header>`, logoBase64, userName)
 }
 
@@ -5563,6 +5583,24 @@ func renderServicesPage(w http.ResponseWriter, r *http.Request) {
     <footer>
         <p>&copy; 2025 Dinas Pendidikan Provinsi DKI Jakarta. All rights reserved.</p>
     </footer>
+    <script>
+        // Update header dengan data dari sessionStorage SSO jika tersedia
+        (function() {
+            try {
+                const ssoUserInfoStr = sessionStorage.getItem('sso_user_info');
+                if (ssoUserInfoStr) {
+                    const ssoUserInfo = JSON.parse(ssoUserInfoStr);
+                    const userNameSpan = document.getElementById('headerUserName');
+                    if (userNameSpan && ssoUserInfo.name) {
+                        userNameSpan.textContent = ssoUserInfo.name;
+                        console.log('✅ Updated header name from SSO:', ssoUserInfo.name);
+                    }
+                }
+            } catch (error) {
+                console.error('Error updating header from SSO:', error);
+            }
+        })();
+    </script>
 </body>
 </html>`, header)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -5664,6 +5702,23 @@ func renderNewsPage(w http.ResponseWriter, r *http.Request) {
         <p>&copy; 2025 Dinas Pendidikan Provinsi DKI Jakarta. All rights reserved.</p>
     </footer>
     <script>
+        // Update header dengan data dari sessionStorage SSO jika tersedia
+        (function() {
+            try {
+                const ssoUserInfoStr = sessionStorage.getItem('sso_user_info');
+                if (ssoUserInfoStr) {
+                    const ssoUserInfo = JSON.parse(ssoUserInfoStr);
+                    const userNameSpan = document.getElementById('headerUserName');
+                    if (userNameSpan && ssoUserInfo.name) {
+                        userNameSpan.textContent = ssoUserInfo.name;
+                        console.log('✅ Updated header name from SSO:', ssoUserInfo.name);
+                    }
+                }
+            } catch (error) {
+                console.error('Error updating header from SSO:', error);
+            }
+        })();
+        
         async function loadNews() {
             try {
                 const res = await fetch('/api/news');

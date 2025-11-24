@@ -18,6 +18,16 @@
 // Jika di localhost, gunakan local Keycloak (localhost:8080)
 // Jika di production, gunakan production Keycloak (https://sso.dinas-pendidikan.go.id)
 function getKeycloakBaseUrl() {
+    // PENTING: Cek dulu apakah ada Keycloak URL yang disimpan di sessionStorage
+    // Ini untuk handle kasus dimana authorization code berasal dari Keycloak yang berbeda
+    // (misalnya: production website tapi redirect ke local Keycloak)
+    const storedKeycloakUrl = sessionStorage.getItem('keycloak_base_url');
+    if (storedKeycloakUrl) {
+        console.log('📍 Using stored Keycloak URL from sessionStorage:', storedKeycloakUrl);
+        return storedKeycloakUrl;
+    }
+    
+    // Auto-detect berdasarkan hostname
     const hostname = window.location.hostname;
     if (hostname === 'localhost' || hostname === '127.0.0.1') {
         return 'http://localhost:8080'; // Local Keycloak
@@ -61,6 +71,27 @@ async function handleSSOCallback() {
     // Jika ada code, exchange untuk token
     if (code) {
         console.log('🔐 Authorization code ditemukan, memulai exchange token...');
+        
+        // PENTING: Jika tidak ada Keycloak URL di sessionStorage, coba detect dari referrer
+        // Ini untuk handle kasus dimana user mengakses production website tapi redirect ke local Keycloak
+        if (!sessionStorage.getItem('keycloak_base_url')) {
+            const referrer = document.referrer;
+            if (referrer) {
+                try {
+                    const referrerUrl = new URL(referrer);
+                    // Jika referrer adalah localhost:8080, gunakan local Keycloak
+                    if (referrerUrl.hostname === 'localhost' && referrerUrl.port === '8080') {
+                        sessionStorage.setItem('keycloak_base_url', 'http://localhost:8080');
+                        console.log('📍 Detected local Keycloak from referrer, saved to sessionStorage');
+                    } else if (referrerUrl.hostname === 'sso.dinas-pendidikan.go.id') {
+                        sessionStorage.setItem('keycloak_base_url', 'https://sso.dinas-pendidikan.go.id');
+                        console.log('📍 Detected production Keycloak from referrer, saved to sessionStorage');
+                    }
+                } catch (e) {
+                    console.log('⚠️ Could not parse referrer URL:', e);
+                }
+            }
+        }
         
         // Verify state (CSRF protection)
         const storedState = sessionStorage.getItem('oauth_state');
@@ -112,10 +143,14 @@ async function handleSSOCallback() {
 // ============================================
 async function exchangeCodeForToken(code) {
     try {
-        const tokenUrl = `${SSO_CONFIG.keycloakBaseUrl}/realms/${SSO_CONFIG.realm}/protocol/openid-connect/token`;
+        // PENTING: Gunakan Keycloak URL yang sama dengan yang digunakan saat authorization
+        // Cek dulu dari sessionStorage (disimpan saat redirect ke Keycloak)
+        const keycloakBaseUrl = sessionStorage.getItem('keycloak_base_url') || SSO_CONFIG.keycloakBaseUrl;
+        const tokenUrl = `${keycloakBaseUrl}/realms/${SSO_CONFIG.realm}/protocol/openid-connect/token`;
         
         console.log('🔄 Exchanging authorization code untuk token...');
         console.log('📍 Token URL:', tokenUrl);
+        console.log('📍 Keycloak Base URL:', keycloakBaseUrl, '(from sessionStorage:', !!sessionStorage.getItem('keycloak_base_url'), ')');
         
         // Get code_verifier dari sessionStorage (untuk PKCE)
         const codeVerifier = sessionStorage.getItem('oauth_code_verifier');
@@ -184,7 +219,9 @@ async function exchangeCodeForToken(code) {
 // ============================================
 async function verifyToken(accessToken) {
     try {
-        const userinfoUrl = `${SSO_CONFIG.keycloakBaseUrl}/realms/${SSO_CONFIG.realm}/protocol/openid-connect/userinfo`;
+        // Gunakan Keycloak URL yang sama dengan yang digunakan saat token exchange
+        const keycloakBaseUrl = sessionStorage.getItem('keycloak_base_url') || SSO_CONFIG.keycloakBaseUrl;
+        const userinfoUrl = `${keycloakBaseUrl}/realms/${SSO_CONFIG.realm}/protocol/openid-connect/userinfo`;
         
         const response = await fetch(userinfoUrl, {
             headers: {
@@ -263,6 +300,7 @@ async function autoLogin(userInfo, accessToken, idToken) {
         sessionStorage.removeItem('redirect_after_login');
         sessionStorage.removeItem('oauth_state'); // Clear state setelah login berhasil
         sessionStorage.removeItem('oauth_code_verifier'); // Clear code_verifier setelah login berhasil
+        sessionStorage.removeItem('keycloak_base_url'); // Clear Keycloak URL setelah login berhasil
         
         // Show loading message
         showLoadingMessage('Login berhasil! Mengalihkan...');
@@ -354,6 +392,11 @@ async function createAppSession(user, accessToken) {
 function redirectToKeycloak() {
     // Simpan URL saat ini untuk redirect setelah login
     sessionStorage.setItem('redirect_after_login', window.location.pathname);
+    
+    // PENTING: Simpan Keycloak base URL yang akan digunakan
+    // Ini memastikan token exchange menggunakan URL yang sama dengan authorization
+    sessionStorage.setItem('keycloak_base_url', SSO_CONFIG.keycloakBaseUrl);
+    console.log('💾 Saved Keycloak base URL to sessionStorage:', SSO_CONFIG.keycloakBaseUrl);
     
     // Generate state untuk CSRF protection
     const state = generateRandomString(32);
@@ -479,6 +522,7 @@ function clearSSOSession() {
     sessionStorage.removeItem('oauth_state');
     sessionStorage.removeItem('oauth_code_verifier');
     sessionStorage.removeItem('redirect_after_login');
+    sessionStorage.removeItem('keycloak_base_url');
     localStorage.removeItem('app_session_token');
     console.log('✅ SSO session cleared');
 }
