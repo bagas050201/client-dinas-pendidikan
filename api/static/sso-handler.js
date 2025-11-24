@@ -223,10 +223,25 @@ async function exchangeCodeForToken(code) {
                 body: new URLSearchParams(params)
             });
         } catch (fetchError) {
-            // Jika fetch gagal (misalnya ERR_NAME_NOT_RESOLVED), coba URL alternatif
+            // Jika fetch gagal, analisa error
             console.error('❌ Fetch error:', fetchError.message);
+            console.error('❌ Error details:', fetchError);
             
-            // Jika menggunakan local Keycloak tapi gagal, coba production
+            // Jika menggunakan local Keycloak dari production website, ini akan selalu gagal
+            // karena production website (HTTPS) tidak bisa akses localhost (HTTP) karena mixed content policy
+            if (keycloakBaseUrl === 'http://localhost:8080' && 
+                window.location.protocol === 'https:') {
+                console.error('❌ CRITICAL: Cannot access localhost:8080 from HTTPS production website');
+                console.error('💡 Solution: Authorization code from local Keycloak must be exchanged from localhost client website');
+                console.error('💡 Please access client website from http://localhost:8070 instead of production URL');
+                
+                // Jangan retry ke production karena authorization code tidak valid untuk production Keycloak
+                alert('Error: Tidak bisa mengakses local Keycloak dari production website.\n\n' +
+                      'Solusi: Akses client website dari http://localhost:8070 untuk menggunakan local Keycloak.');
+                return null;
+            }
+            
+            // Jika menggunakan local Keycloak tapi gagal karena network error lain, coba production
             if (keycloakBaseUrl === 'http://localhost:8080' && 
                 (fetchError.message.includes('Failed to fetch') || fetchError.message.includes('ERR_NAME_NOT_RESOLVED'))) {
                 console.log('🔄 Retrying with production Keycloak URL...');
@@ -246,6 +261,11 @@ async function exchangeCodeForToken(code) {
                     console.log('✅ Retry with production URL successful');
                 } catch (retryError) {
                     console.error('❌ Retry also failed:', retryError);
+                    console.error('❌ Production Keycloak URL also not accessible');
+                    alert('Error: Tidak bisa mengakses Keycloak server.\n\n' +
+                          'Pastikan:\n' +
+                          '1. Jika menggunakan local Keycloak, akses dari http://localhost:8070\n' +
+                          '2. Jika menggunakan production Keycloak, pastikan domain tersedia');
                     return null;
                 }
             } else {
