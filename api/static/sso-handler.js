@@ -101,19 +101,16 @@ async function handleSSOCallback() {
             // Jika oauth_state ada, berarti user pernah redirect ke Keycloak
             // Tapi kita tidak tahu URL Keycloak yang digunakan, jadi kita perlu cara lain
             
-            // Fallback: Jika hostname production tapi tidak ada referrer, coba local Keycloak dulu
+            // Fallback: Jika hostname production tapi tidak ada referrer/keycloak URL, coba local Keycloak dulu
             // (karena kemungkinan besar user redirect dari local SSO website)
             if (!keycloakBaseUrl && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-                // Coba local Keycloak dulu (karena kemungkinan besar dari local SSO website)
-                // Tapi hanya jika kita yakin ini dari local SSO (misalnya ada state di sessionStorage)
-                const hasOAuthState = sessionStorage.getItem('oauth_state');
-                if (hasOAuthState) {
-                    // Ada state, berarti user pernah redirect ke Keycloak
-                    // Tapi kita tidak tahu URL-nya, jadi coba local dulu
-                    console.log('⚠️ No Keycloak URL found but oauth_state exists, trying local Keycloak as fallback');
-                    keycloakBaseUrl = 'http://localhost:8080';
-                    sessionStorage.setItem('keycloak_base_url', keycloakBaseUrl);
-                }
+                // Jika production website dan ada authorization code, kemungkinan besar dari local SSO website
+                // Langsung coba local Keycloak dulu (tidak perlu cek oauth_state karena mungkin tidak ada)
+                console.log('⚠️ No Keycloak URL found in sessionStorage or referrer');
+                console.log('🔄 Production website detected, trying local Keycloak as primary option');
+                keycloakBaseUrl = 'http://localhost:8080';
+                sessionStorage.setItem('keycloak_base_url', keycloakBaseUrl);
+                console.log('📍 Set keycloak_base_url to local Keycloak:', keycloakBaseUrl);
             }
         }
         
