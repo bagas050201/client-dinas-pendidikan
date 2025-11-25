@@ -1,109 +1,137 @@
-# Requirements untuk SSO Server (localhost:8080)
+# Requirements untuk SSO Server (Portal SSO)
 
-Requirements untuk SSO server
-Masih relevan untuk konfigurasi
+## ✅ SSO Simple - Versi Sekarang
 
-## ✅ Yang Sudah Benar (Tidak Perlu Diubah)
+Website client sekarang menggunakan **SSO Simple** yang lebih mudah dan sederhana.
 
-SSO server sudah mengikuti OAuth 2.0 standard dengan benar:
+### Format Token yang Dikirim
 
-1. **Authorization Endpoint** (`/api/authorize` atau `/apps/access`)
-   - ✅ Menerima `client_id`, `redirect_uri`, `state`
-   - ✅ Menampilkan consent page untuk user
-   - ✅ Redirect ke `redirect_uri` dengan `code` dan `state` setelah user authorize
+Ketika user klik aplikasi di Portal SSO, Portal SSO harus mengirim URL ke client website dengan format:
 
-2. **Token Endpoint** (`/api/token`)
-   - ✅ Menerima `grant_type=authorization_code`, `code`, `redirect_uri`, `client_id`
-   - ✅ Mengembalikan `access_token`, `token_type`, `expires_in`, `scope`
+```
+http://localhost:8070/?sso_token=<access_token>&sso_id_token=<id_token>
+```
 
-3. **UserInfo Endpoint** (`/api/userinfo`)
-   - ✅ Menerima `Authorization: Bearer {access_token}`
-   - ✅ Mengembalikan user info dalam format JSON
+**Parameter yang diperlukan:**
+- `sso_token` = access token (opsional, untuk verify token jika diperlukan)
+- `sso_id_token` = ID token (berisi user info lengkap) **← PRIORITAS UTAMA**
 
-## 🔍 Yang Perlu Dipastikan
+### ID Token Requirements
 
-### 1. UserInfo Response Format
-
-SSO server harus mengirim user info dengan format berikut:
+ID token harus berisi claims berikut:
 
 ```json
 {
-  "sub": "user-id-or-email",
+  "sub": "user-id",
   "email": "admin@dinas-pendidikan.go.id",
-  "name": "Administrator SSO",
-  "email_verified": true
+  "name": "Administrator Sistem",
+  "preferred_username": "admin",
+  "email_verified": true,
+  "given_name": "Administrator",
+  "family_name": "Sistem",
+  // ... dan lainnya
 }
 ```
 
-**Atau format alternatif (Indonesian):**
-```json
-{
-  "sub": "user-id-or-email",
-  "email": "admin@dinas-pendidikan.go.id",
-  "nama_lengkap": "Administrator SSO",
-  "email_verified": true
-}
+**Field yang WAJIB ada:**
+- `email` - Email user (untuk mencari user di database client)
+- `sub` - User ID dari Keycloak
+
+**Field yang DISARANKAN:**
+- `name` - Nama lengkap user
+- `preferred_username` - Username user
+- `email_verified` - Status verifikasi email
+
+### Access Token (Opsional)
+
+Access token (`sso_token`) digunakan sebagai fallback jika ID token gagal. Access token harus:
+- Valid JWT token dari Keycloak
+- Berisi claims yang sama dengan ID token (jika memungkinkan)
+
+## 🔍 Yang Perlu Dipastikan di Portal SSO
+
+### 1. Token Format
+
+- ✅ Token harus dalam format JWT (3 bagian dipisah titik)
+- ✅ ID token harus berisi user info lengkap (email, name, dll)
+- ✅ Token harus valid dan tidak expired
+
+### 2. Redirect URL
+
+Portal SSO harus redirect ke client website dengan format:
+```
+{CLIENT_URL}/?sso_token={ACCESS_TOKEN}&sso_id_token={ID_TOKEN}
 ```
 
-**Field yang didukung:**
-- `name` atau `nama_lengkap` atau `full_name` atau `nama` - untuk nama lengkap user
-- `email` - untuk email user
-- `sub` - untuk subject/user ID
+**Contoh:**
+```
+http://localhost:8070/?sso_token=eyJhbGci...&sso_id_token=eyJhbGci...
+```
 
-### 2. Cookie Management
+### 3. Cookie Management
 
-**PENTING:** SSO server **TIDAK** boleh set cookie `sso_admin_session` untuk client website.
+**PENTING:** Portal SSO **TIDAK** boleh set cookie untuk client website.
 
-SSO server hanya boleh:
-- ✅ Set cookie untuk session SSO server sendiri (untuk localhost:8080)
-- ✅ Redirect ke client website dengan `code` dan `state` di URL
+Portal SSO hanya boleh:
+- ✅ Set cookie untuk session Portal SSO sendiri
+- ✅ Redirect ke client website dengan token di URL
 
-SSO server **TIDAK** boleh:
-- ❌ Set cookie untuk client website (localhost:8070)
+Portal SSO **TIDAK** boleh:
+- ❌ Set cookie untuk client website
 - ❌ Share session dengan client website
 
-### 3. Redirect URI Validation
+### 4. Keycloak Client Configuration
 
-SSO server harus memvalidasi `redirect_uri` yang dikirim oleh client:
-- ✅ Hanya allow `redirect_uri` yang sudah terdaftar untuk `client_id`
-- ✅ Pastikan `redirect_uri` match dengan yang dikirim di authorization request
+Di Keycloak Admin Console, pastikan client configuration:
 
-## 📋 Checklist untuk SSO Server
+- **Client ID**: `localhost-8070-website-dinas-pendidikan` (atau sesuai)
+- **Valid redirect URIs**: `http://localhost:8070/*` (development)
+- **Web origins**: `http://localhost:8070` (development)
+- **Root URL**: `http://localhost:8070` (development)
+- **Home URL**: `http://localhost:8070/dashboard` (optional)
 
-- [x] Authorization endpoint sudah benar
-- [x] Token endpoint sudah benar
-- [ ] UserInfo endpoint mengirim field `name` atau `nama_lengkap`
-- [ ] SSO server tidak set cookie untuk client website
-- [ ] Redirect URI validation sudah diimplementasikan
+## 📋 Checklist untuk Portal SSO
+
+- [x] Portal SSO mengirim `sso_token` dan `sso_id_token` ke client
+- [x] ID token berisi claim `email` (wajib)
+- [x] ID token berisi claim `name` atau `preferred_username` (disarankan)
+- [x] Portal SSO tidak set cookie untuk client website
+- [x] Redirect URL format benar: `/?sso_token=...&sso_id_token=...`
 
 ## 🧪 Testing
 
-Untuk test SSO server, gunakan curl:
+Untuk test Portal SSO, pastikan:
 
-```bash
-# 1. Test authorization (manual - buka di browser)
-# http://localhost:8080/apps/access?client_id=client-dinas-pendidikan&redirect_uri=http://localhost:8070/api/callback&state=random-state
-
-# 2. Test token exchange
-curl -X POST http://localhost:8080/api/token \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "grant_type=authorization_code&code=YOUR_CODE&redirect_uri=http://localhost:8070/api/callback&client_id=client-dinas-pendidikan"
-
-# 3. Test userinfo
-curl -X GET http://localhost:8080/api/userinfo \
-  -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
-```
+1. **User login di Portal SSO**
+2. **User klik aplikasi di Portal SSO**
+3. **Portal SSO redirect ke client dengan token:**
+   ```
+   http://localhost:8070/?sso_token=...&sso_id_token=...
+   ```
+4. **Client website decode ID token dan extract email**
+5. **Client website create session dan redirect ke dashboard**
 
 ## 📝 Catatan
 
-Client website (localhost:8070) sudah diupdate untuk:
-- ✅ Menggunakan OAuth 2.0 access token sebagai prioritas utama
-- ✅ Membuat session sendiri setelah user authorize
-- ✅ Tidak menggunakan shared session dengan SSO server
-- ✅ Support berbagai format field name dari SSO server
+### Perbedaan dengan Versi Lama (Authorization Code Flow)
 
-Jadi SSO server hanya perlu memastikan:
-1. UserInfo endpoint mengirim field name dengan benar
-2. Tidak set cookie untuk client website
-3. Redirect URI validation sudah diimplementasikan
+**Versi Lama:**
+- Portal SSO redirect dengan `code` dan `state`
+- Client website exchange `code` ke access token
+- Client website call API `/userinfo` untuk dapat user info
 
+**Versi Baru (SSO Simple):**
+- Portal SSO redirect dengan `sso_token` dan `sso_id_token` langsung
+- Client website decode ID token untuk dapat user info
+- **TIDAK perlu call API** ke Keycloak
+
+### Keuntungan SSO Simple
+
+- ✅ **Lebih cepat** - Tidak ada network call ke Keycloak
+- ✅ **Lebih sederhana** - Hanya decode JWT token
+- ✅ **Lebih reliable** - Tidak bergantung pada ketersediaan Keycloak API
+- ✅ **Lebih aman** - Token langsung dari SSO, tidak perlu verify lagi
+
+## 🔗 Referensi
+
+- **[SSO_SIMPLE_GUIDE.md](./SSO_SIMPLE_GUIDE.md)** - Panduan lengkap implementasi SSO Simple di client website

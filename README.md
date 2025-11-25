@@ -7,7 +7,24 @@ Website client untuk Dinas Pendidikan Provinsi DKI Jakarta.
 - **Backend**: Go (Golang) dengan Vercel Serverless Functions
 - **Frontend**: HTML, CSS (inline), JavaScript (vanilla)
 - **Database**: Supabase (REST API)
+- **SSO**: Keycloak (SSO Simple - token-based authentication)
 - **Deployment**: Vercel
+
+## 🔐 SSO Integration
+
+Website ini menggunakan **SSO Simple** untuk autentikasi. Portal SSO mengirim token langsung ke client, dan client hanya perlu decode token untuk mendapatkan user info **TANPA perlu call API ke Keycloak**.
+
+📖 **Panduan Lengkap:** Lihat [SSO_SIMPLE_GUIDE.md](./SSO_SIMPLE_GUIDE.md)
+
+### Quick Start SSO
+
+1. Portal SSO mengirim URL: `/?sso_token=<access_token>&sso_id_token=<id_token>`
+2. Backend decode `sso_id_token` untuk dapat user info
+3. Extract email dari claims
+4. Create session dengan email
+5. Redirect ke dashboard
+
+**Tidak perlu call API ke Keycloak!**
 
 ## Setup
 
@@ -39,9 +56,8 @@ Edit `.env` dan isi dengan:
 ```
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_KEY=your-anon-key
-JWT_PRIVATE_KEY=your-jwt-private-key
-JWT_PUBLIC_KEY=your-jwt-public-key
-PORT=8080
+JWT_PUBLIC_KEY=your-jwt-public-key  # Optional: untuk signature validation (development mode jika tidak di-set)
+PORT=8070
 ```
 
 4. Setup database di Supabase:
@@ -131,20 +147,21 @@ vercel --prod
 ```
 
 4. Set environment variables di Vercel Dashboard:
-   - `SUPABASE_URL`
-   - `SUPABASE_KEY`
-   - `JWT_PRIVATE_KEY`
-   - `JWT_PUBLIC_KEY`
+   - `SUPABASE_URL` (required)
+   - `SUPABASE_KEY` (required)
+   - `JWT_PUBLIC_KEY` (optional: untuk signature validation, development mode jika tidak di-set)
 
 ## Features
 
 - ✅ Authentication (Login/Register)
+- ✅ SSO Integration (SSO Simple - token-based)
 - ✅ Session Management
 - ✅ Home Page dengan pengumuman
 - ✅ About Page
 - ✅ Services Page
 - ✅ News/Announcements Page
 - ✅ Profile Page dengan edit profile dan change password
+- ✅ Dashboard dengan informasi user
 - ✅ Responsive Design
 - ✅ Lighthouse Optimized
 
@@ -187,12 +204,30 @@ client-dinas-pendidikan/
 └── README.md                     # Documentation
 ```
 
+## Documentation
+
+### 📖 SSO Simple (Versi Terbaru)
+
+- **[SSO_SIMPLE_GUIDE.md](./SSO_SIMPLE_GUIDE.md)** ⭐ - Panduan lengkap implementasi SSO Simple (versi terbaru)
+- **[SSO_SERVER_REQUIREMENTS.md](./SSO_SERVER_REQUIREMENTS.md)** - Requirements untuk Portal SSO (SSO Simple)
+- **[SSO_TROUBLESHOOTING.md](./SSO_TROUBLESHOOTING.md)** - Troubleshooting guide untuk SSO Simple
+- **[SSO_USER_DATA_FLOW.md](./SSO_USER_DATA_FLOW.md)** - Flow mendapatkan data user dari SSO (SSO Simple)
+
+### 📚 Legacy Documentation (Authorization Code Flow)
+
+> ⚠️ **Catatan:** Dokumentasi berikut untuk versi lama yang sudah tidak digunakan.
+
+- **[README_SSO.md](./README_SSO.md)** - Dokumentasi SSO (legacy - Authorization Code Flow dengan PKCE)
+- **[SSO_CLIENT_IMPLEMENTATION_GUIDE.md](./SSO_CLIENT_IMPLEMENTATION_GUIDE.md)** - Panduan implementasi SSO client (legacy)
+- **[SSO_FLOW_README.md](./SSO_FLOW_README.md)** - Dokumentasi alur SSO (legacy)
+
 ## Notes
 
 - Semua handler logic ada di `api/main_handler.go` untuk menghindari "undefined" errors di Vercel
 - Logo dan assets di-embed menggunakan `//go:embed`
 - CSS dan JavaScript inline untuk performance (Lighthouse optimization)
 - Session management menggunakan cookie-based dengan storage di Supabase
+- **SSO Simple**: Portal SSO mengirim token langsung, client hanya perlu decode token (tidak perlu call API)
 
 ## License
 

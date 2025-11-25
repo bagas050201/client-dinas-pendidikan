@@ -1,5 +1,11 @@
 # Panduan Implementasi SSO Client (Keycloak Authorization Code Flow)
 
+> ⚠️ **CATATAN:** Panduan ini untuk **versi lama** (Authorization Code Flow dengan PKCE).  
+> Website client sekarang menggunakan **SSO Simple** yang lebih mudah.  
+> 📖 **Lihat [SSO_SIMPLE_GUIDE.md](./SSO_SIMPLE_GUIDE.md) untuk panduan versi terbaru.**
+
+---
+
 ## 📋 Daftar Isi
 1. [Overview](#overview)
 2. [Prerequisites](#prerequisites)
@@ -15,9 +21,11 @@
 
 ---
 
-## Overview
+## Overview (Legacy)
 
 Panduan ini menjelaskan implementasi SSO (Single Sign-On) dari sisi **Client Website** menggunakan **OAuth 2.0 Authorization Code Flow** dengan Keycloak. Client website akan menerima callback dari Portal SSO (yang menggunakan Keycloak) setelah user berhasil login.
+
+**⚠️ Versi ini sudah tidak digunakan. Gunakan SSO Simple sebagai gantinya.**
 
 **Format Callback URL:**
 ```

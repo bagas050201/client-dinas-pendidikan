@@ -1,8 +1,16 @@
 # Integrasi SSO untuk Client Dinas Pendidikan
 
-## Overview
+> ⚠️ **CATATAN:** Dokumentasi ini untuk **versi lama** (Authorization Code Flow dengan PKCE).  
+> Website client sekarang menggunakan **SSO Simple** yang lebih mudah.  
+> 📖 **Lihat [SSO_SIMPLE_GUIDE.md](./SSO_SIMPLE_GUIDE.md) untuk panduan versi terbaru.**
+
+---
+
+## Overview (Legacy)
 
 Website client telah diintegrasikan dengan SSO (Single Sign-On) menggunakan OAuth 2.0 Authorization Code flow dengan PKCE (Proof Key for Code Exchange) untuk keamanan tambahan.
+
+**⚠️ Versi ini sudah tidak digunakan. Gunakan SSO Simple sebagai gantinya.**
 
 ## Environment Variables
 

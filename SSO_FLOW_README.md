@@ -1,10 +1,18 @@
 # 📚 Dokumentasi Alur SSO (Single Sign-On)
 
+> ⚠️ **CATATAN:** Dokumentasi ini untuk **versi lama** (Authorization Code Flow).  
+> Website client sekarang menggunakan **SSO Simple** yang lebih mudah.  
+> 📖 **Lihat [SSO_SIMPLE_GUIDE.md](./SSO_SIMPLE_GUIDE.md) untuk panduan versi terbaru.**
+
+---
+
 Membahas Supabase (24 matches)
 Dokumentasi alur SSO dengan database Supabase
 Arsitektur dan flow diagram
 
 Dokumentasi lengkap untuk memahami alur SSO di Client Website Dinas Pendidikan DKI Jakarta.
+
+**⚠️ Versi ini sudah tidak digunakan. Gunakan SSO Simple sebagai gantinya.**
 
 ---
 

@@ -1,333 +1,287 @@
-# Flow Mendapatkan Data User dari SSO dan Menampilkannya
-
-Membahas Supabase (31 matches)
-Flow mendapatkan data user dari SSO dan menyimpan ke Supabase
-Penjelasan tabel pengguna dan sesi_login di Supabase
+# Flow Mendapatkan Data User dari SSO (SSO Simple)
 
 ## 📋 Overview
 
-Dokumen ini menjelaskan bagaimana website client mendapatkan data user dari SSO Keycloak dan menampilkannya di halaman website.
+Dokumen ini menjelaskan bagaimana website client mendapatkan data user dari Portal SSO menggunakan **SSO Simple** dan menampilkannya di halaman website.
 
-## 🔄 Flow Lengkap
+## 🔄 Flow Lengkap (SSO Simple)
 
-### **STEP 1: Website SSO Mengirim Token**
+### **STEP 1: Portal SSO Mengirim Token**
 
-Ketika user klik aplikasi di Portal SSO, website SSO akan redirect ke website client dengan token di URL:
+Ketika user klik aplikasi di Portal SSO, Portal SSO akan redirect ke website client dengan token di URL:
 
 ```
-localhost:8070/login?sso_token=<JWT_TOKEN>&sso_id_token=<ID_TOKEN>&sso_client_id=localhost-8070-website-dinas-pendidikan
+http://localhost:8070/?sso_token=<access_token>&sso_id_token=<id_token>
 ```
 
-**File:** `api/main_handler.go` (line ~83-94)
-- Handler root path (`/`) detect `sso_token` di URL
-- Redirect ke `/login` dengan parameter token
+**File:** `api/main_handler.go` (Handler function untuk root path `/`)
+- Handler detect `sso_token` dan `sso_id_token` di URL
+- Prioritas: `sso_id_token` diproses terlebih dahulu (karena sudah berisi user info)
 
 ---
 
-### **STEP 2: Frontend Decode JWT Token**
+### **STEP 2: Backend Decode ID Token**
 
-Script `sso-handler.js` otomatis detect token saat page load dan decode JWT untuk extract user info.
+Backend decode ID token untuk extract user info **TANPA perlu call API ke Keycloak**.
 
-**File:** `api/static/sso-handler.js` (line ~25-73)
-
-```javascript
-// 1. Detect token dari URL
-const ssoToken = urlParams.get('sso_token');
-
-// 2. Decode JWT token
-const userInfo = await verifyToken(ssoToken);
-```
-
-**File:** `api/static/sso-handler.js` (line ~103-139)
-
-```javascript
-function decodeJWTToken(token) {
-    // Decode JWT payload (base64url)
-    const decoded = JSON.parse(atob(padded));
-    
-    // Extract user info dari JWT claims
-    const userInfo = {
-        sub: decoded.sub,              // User ID dari Keycloak
-        email: decoded.email,           // Email user
-        name: decoded.name,             // Nama lengkap
-        preferred_username: decoded.preferred_username,
-        email_verified: decoded.email_verified,
-        peran: decoded.peran || 'user' // Role/peran
-    };
-    
-    return userInfo;
-}
-```
-
-**Data yang di-extract dari JWT:**
-- `sub`: User ID dari Keycloak (contoh: `86bef184-5c28-47c9-b6dc-1bd515b1e7cf`)
-- `email`: Email user (contoh: `admin@dinas-pendidikan.go.id`)
-- `name`: Nama lengkap (contoh: `Admin Dinas Pendidikan`)
-- `preferred_username`: Username (contoh: `admin`)
-- `peran`: Role/peran user (jika ada di JWT)
-
----
-
-### **STEP 3: Check atau Create User di Database**
-
-Setelah decode token, frontend mengirim data user ke backend untuk check/create user di Supabase.
-
-**File:** `api/static/sso-handler.js` (line ~193-221)
-
-```javascript
-// POST /api/users/sso-login
-const response = await fetch('/api/users/sso-login', {
-    method: 'POST',
-    headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${accessToken}`
-    },
-    body: JSON.stringify({
-        email: userData.email,        // dari JWT
-        name: userData.name,          // dari JWT
-        keycloak_id: userData.id      // sub dari JWT
-    })
-});
-```
-
-**File:** `api/main_handler.go` (line ~3643-3842)
+**File:** `api/main_handler.go` (function `handleSSOTokenWithCookie`)
 
 ```go
-func handleSSOUserLoginAPI(w http.ResponseWriter, r *http.Request) {
-    // 1. Parse request body
-    var req struct {
-        Email      string `json:"email"`
-        Name       string `json:"name"`
-        KeycloakID string `json:"keycloak_id"`
-    }
-    
-    // 2. Check user di Supabase berdasarkan email
-    // Query: SELECT * FROM pengguna WHERE email = ?
-    
-    // 3. Jika user tidak ada, create user baru
-    if len(users) == 0 {
-        userData := map[string]interface{}{
-            "email":       req.Email,
-            "nama_lengkap": req.Name,
-            "peran":       "user",
-            "aktif":       true,
-        }
-        // INSERT ke Supabase
-    }
-    
-    // 4. Return user data
-    response := map[string]interface{}{
-        "user": map[string]interface{}{
-            "id":          userID,        // id_pengguna dari Supabase
-            "email":       user["email"],
-            "name":        user["nama_lengkap"],
-            "keycloak_id": req.KeycloakID,
-        },
-    }
-}
+// Decode JWT token
+parsedToken, err := jwt.Parse(token, ...)
+
+// Extract claims
+claims := parsedToken.Claims.(jwt.MapClaims)
+
+// Extract email dari claims
+email := claims["email"].(string)
 ```
 
-**Hasil:**
-- User data disimpan di Supabase (tabel `pengguna`)
-- Return `id_pengguna` (UUID dari Supabase) dan data user
+**Claims yang diextract:**
+- `email` - Email user (prioritas utama)
+- `preferred_username` - Username (fallback)
+- `sub` - User ID (fallback jika seperti email)
+
+---
+
+### **STEP 3: Cari User di Database**
+
+Backend mencari user di database berdasarkan email dari token.
+
+**File:** `api/main_handler.go` (function `createSessionFromEmail`)
+
+```go
+// Query user dari Supabase
+apiURL := fmt.Sprintf("%s/rest/v1/pengguna?email=eq.%s", supabaseURL, email)
+
+// Jika user tidak ditemukan, return error
+// (atau bisa auto-create user jika diimplementasikan)
+```
+
+**Database Schema:**
+- Tabel: `pengguna`
+- Field: `id_pengguna` (PK), `email`, `nama_lengkap`, `peran`, `aktif`
 
 ---
 
 ### **STEP 4: Create Session**
 
-Setelah user di-check/create, frontend membuat session aplikasi.
+Backend create session di database untuk user.
 
-**File:** `api/static/sso-handler.js` (line ~226-259)
-
-```javascript
-// POST /api/auth/sso-login
-const response = await fetch('/api/auth/sso-login', {
-    method: 'POST',
-    headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${accessToken}`
-    },
-    body: JSON.stringify({
-        email: user.email,
-        keycloak_id: user.keycloak_id
-    })
-});
-```
-
-**File:** `api/main_handler.go` (line ~3844-3958)
+**File:** `api/main_handler.go` (function `createSessionFromEmail`)
 
 ```go
-func handleSSOAuthLoginAPI(w http.ResponseWriter, r *http.Request) {
-    // 1. Get user by email dari Supabase
-    // 2. Create session di Supabase (tabel sesi_login)
-    sessionID, err := session.CreateSession(userID, r)
-    
-    // 3. Set cookie
-    helpers.SetCookie(w, r, "client_dinas_session", sessionID, 86400)
-    
-    // 4. Return session token
-    response := map[string]interface{}{
-        "session_token": sessionID,
-        "user": map[string]interface{}{
-            "id":    userID,
-            "email": user["email"],
-            "name":  user["nama_lengkap"],
-        },
-    }
+// Generate session ID
+sessionID, err := helpers.GenerateSessionID()
+
+// Create session di Supabase
+sessionData := map[string]interface{}{
+    "id_pengguna": userID,
+    "id_sesi": sessionID,
+    "ip": getIPAddress(r),
+    "user_agent": r.UserAgent(),
+    "kadaluarsa": expiresAt,
 }
 ```
 
-**Hasil:**
-- Session dibuat di Supabase (tabel `sesi_login`)
-- Cookie `client_dinas_session` diset di browser
-- User bisa akses halaman protected
+**Database Schema:**
+- Tabel: `sesi_login`
+- Field: `id` (PK), `id_sesi`, `id_pengguna`, `ip`, `user_agent`, `kadaluarsa`
 
 ---
 
-### **STEP 5: Ambil Data User untuk Ditampilkan**
+### **STEP 5: Set Cookie**
 
-Setelah user login, setiap halaman yang membutuhkan data user akan:
+Backend set cookie untuk session management.
 
-1. **Ambil session ID dari cookie**
-2. **Validate session di Supabase**
-3. **Ambil user ID dari session**
-4. **Query user data dari Supabase**
-5. **Tampilkan data user di halaman**
-
-**File:** `api/main_handler.go` (line ~577-622)
+**File:** `api/main_handler.go` (function `handleSSOTokenWithCookie`)
 
 ```go
-func renderDashboardWithToken(w http.ResponseWriter, r *http.Request) {
-    // 1. Ambil session ID dari cookie
-    sessionID, err := helpers.GetCookie(r, "client_dinas_session")
-    
-    // 2. Validate session di Supabase
-    userID, ok, err := session.ValidateSession(sessionID)
-    
-    // 3. Ambil user data dari Supabase
-    user, err := getUserByIDForDashboard(userID)
-    
-    // 4. Render halaman dengan data user
-    renderDashboardPage(w, user, counts)
-}
+// Set cookie dengan nama yang konsisten
+helpers.SetCookie(w, r, "client_dinas_session", sessionID, 86400) // 24 jam
+helpers.SetCookie(w, r, "session_id", sessionID, 86400) // Backward compatibility
 ```
 
-**File:** `api/main_handler.go` (line ~625-666)
+**Cookie Properties:**
+- Name: `client_dinas_session` (primary), `session_id` (backward compatibility)
+- HttpOnly: true
+- MaxAge: 86400 (24 jam)
+- Path: `/`
+
+---
+
+### **STEP 6: Redirect ke Dashboard**
+
+Backend redirect user ke dashboard setelah session berhasil dibuat.
+
+**File:** `api/main_handler.go` (Handler function)
 
 ```go
-func getUserByID(userID string) (map[string]interface{}, error) {
-    // Query Supabase: SELECT * FROM pengguna WHERE id_pengguna = ?
-    apiURL := fmt.Sprintf("%s/rest/v1/pengguna?id_pengguna=eq.%s&select=*", 
-        supabaseURL, userIDEncoded)
-    
-    // Return user data dari Supabase
-    return users[0], nil
-}
+http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
 ```
 
-**File:** `api/main_handler.go` (line ~693-701)
+---
+
+### **STEP 7: Dashboard Menampilkan Data User**
+
+Dashboard mengambil data user dari database dan menampilkannya.
+
+**File:** `api/main_handler.go` (function `DashboardHandler`)
 
 ```go
-func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, counts map[string]int) {
-    // Extract nama user dari data Supabase
-    userName := "User"
-    if name, ok := user["nama_lengkap"].(string); ok && name != "" {
-        userName = name  // Tampilkan nama dari Supabase
-    } else if email, ok := user["email"].(string); ok {
-        userName = email
-    }
-    
-    // Render HTML dengan data user
-    html := fmt.Sprintf(`...Selamat Datang, %s...`, userName)
-}
+// Get user dari session
+user, err := getCurrentUser(r)
+
+// Render dashboard dengan data user
+renderDashboardPage(w, user, counts)
 ```
+
+**Data yang ditampilkan:**
+- Nama lengkap
+- Email
+- Peran (dengan badge warna)
+- Status (Aktif/Tidak Aktif)
 
 ---
 
 ## 📊 Diagram Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ 1. Website SSO → Redirect dengan Token                         │
-│    localhost:8070/login?sso_token=JWT_TOKEN&...                 │
-└─────────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────────┐
-│ 2. Frontend: sso-handler.js                                     │
-│    - Detect token dari URL                                      │
-│    - Decode JWT token → Extract user info                      │
-│      • email: admin@dinas-pendidikan.go.id                      │
-│      • name: Admin Dinas Pendidikan                             │
-│      • sub: 86bef184-5c28-47c9-b6dc-1bd515b1e7cf               │
-└─────────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────────┐
-│ 3. Backend: POST /api/users/sso-login                           │
-│    - Check user di Supabase (by email)                          │
-│    - Jika tidak ada, create user baru                           │
-│    - Return: { id, email, name, keycloak_id }                   │
-└─────────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────────┐
-│ 4. Backend: POST /api/auth/sso-login                            │
-│    - Get user dari Supabase                                      │
-│    - Create session di Supabase (tabel sesi_login)              │
-│    - Set cookie: client_dinas_session                            │
-│    - Return: { session_token, user }                            │
-└─────────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────────┐
-│ 5. Redirect ke /dashboard                                       │
-└─────────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────────┐
-│ 6. Backend: GET /dashboard                                      │
-│    - Ambil session ID dari cookie                                │
-│    - Validate session di Supabase                                │
-│    - Get user ID dari session                                    │
-│    - Query user data dari Supabase                               │
-│      SELECT * FROM pengguna WHERE id_pengguna = ?               │
-│    - Render halaman dengan data user                             │
-│      • nama_lengkap: Admin Dinas Pendidikan                      │
-│      • email: admin@dinas-pendidikan.go.id                       │
-│      • peran: admin                                              │
-└─────────────────────────────────────────────────────────────────┘
-                            ↓
-┌─────────────────────────────────────────────────────────────────┐
-│ 7. Frontend: Tampilkan data user di halaman                     │
-│    "Selamat Datang, Admin Dinas Pendidikan"                     │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────┐         ┌──────────────────┐         ┌─────────────────┐
+│   Portal SSO    │         │  Client Website  │         │    Database     │
+│  (Keycloak)     │         │  (Backend Go)    │         │   (Supabase)    │
+└────────┬────────┘         └────────┬─────────┘         └────────┬────────┘
+         │                            │                            │
+         │  1. User klik aplikasi     │                            │
+         │                            │                            │
+         │  2. Redirect dengan token  │                            │
+         ├───────────────────────────>│                            │
+         │  URL: /?sso_token=...      │                            │
+         │      &sso_id_token=...     │                            │
+         │                            │                            │
+         │                            │  3. Decode sso_id_token    │
+         │                            │     Extract email          │
+         │                            │                            │
+         │                            │  4. Cari user by email     │
+         │                            ├───────────────────────────>│
+         │                            │                            │
+         │                            │  5. Create session          │
+         │                            ├───────────────────────────>│
+         │                            │                            │
+         │                            │  6. Set cookie             │
+         │                            │                            │
+         │  7. Redirect ke dashboard  │                            │
+         │<───────────────────────────┤                            │
+         │                            │                            │
+         │                            │  8. Get user dari session  │
+         │                            ├───────────────────────────>│
+         │                            │                            │
+         │                            │  9. Render dashboard       │
+         │                            │     dengan data user        │
+         │                            │                            │
 ```
+
+---
+
+## 📋 Data Flow Detail
+
+### 1. Token dari Portal SSO
+
+**Format:**
+```
+sso_token=<access_token>
+sso_id_token=<id_token>
+```
+
+**ID Token Claims:**
+```json
+{
+  "sub": "65d5dd7c-884a-4462-ac32-f41564f8c27b",
+  "email": "admin@dinas-pendidikan.go.id",
+  "name": "Administrator Sistem",
+  "preferred_username": "admin",
+  "email_verified": true,
+  "given_name": "Administrator",
+  "family_name": "Sistem",
+  "iss": "http://localhost:8080/realms/dinas-pendidikan",
+  "aud": "sso-dinas-pendidikan",
+  "exp": 1764039547,
+  "iat": 1764039247
+}
+```
+
+### 2. Email Extraction
+
+Backend extract email dengan prioritas:
+1. `email` claim (prioritas utama)
+2. `preferred_username` claim (fallback)
+3. `sub` claim (fallback jika seperti email)
+
+### 3. User Lookup
+
+**Query ke Supabase:**
+```sql
+SELECT * FROM pengguna WHERE email = 'admin@dinas-pendidikan.go.id';
+```
+
+**Response:**
+```json
+[{
+  "id_pengguna": "uuid-here",
+  "email": "admin@dinas-pendidikan.go.id",
+  "nama_lengkap": "Administrator Sistem",
+  "peran": "admin",
+  "aktif": true
+}]
+```
+
+### 4. Session Creation
+
+**Insert ke Supabase:**
+```sql
+INSERT INTO sesi_login (id_pengguna, id_sesi, ip, user_agent, kadaluarsa)
+VALUES (?, ?, ?, ?, ?);
+```
+
+### 5. Cookie Setting
+
+**Cookie yang di-set:**
+- `client_dinas_session` = sessionID (primary)
+- `session_id` = sessionID (backward compatibility)
+
+### 6. Dashboard Display
+
+**Data yang ditampilkan:**
+- Nama: dari `pengguna.nama_lengkap`
+- Email: dari `pengguna.email`
+- Peran: dari `pengguna.peran` (dengan badge warna)
+- Status: dari `pengguna.aktif` (Aktif/Tidak Aktif)
 
 ---
 
 ## 🔑 Key Points
 
-### **1. Data User dari JWT (Keycloak)**
-- **Sumber:** JWT token dari SSO server
-- **Data:** `email`, `name`, `sub` (user ID Keycloak)
-- **Digunakan untuk:** Check/create user di Supabase
+1. **Tidak Perlu Call API:**
+   - User info langsung dari ID token claims
+   - Tidak perlu call `/userinfo` endpoint ke Keycloak
 
-### **2. Data User dari Supabase**
-- **Sumber:** Tabel `pengguna` di Supabase
-- **Data:** `id_pengguna`, `email`, `nama_lengkap`, `peran`
-- **Digunakan untuk:** Menampilkan di halaman website
+2. **Prioritas Token:**
+   - `sso_id_token` diproses terlebih dahulu (karena sudah berisi user info)
+   - `sso_token` digunakan sebagai fallback
 
-### **3. Session Management**
-- **Sumber:** Tabel `sesi_login` di Supabase
-- **Cookie:** `client_dinas_session` (session ID)
-- **Digunakan untuk:** Validasi user sudah login
+3. **Email adalah Key:**
+   - Email dari token digunakan untuk mencari user di database
+   - Pastikan email di token match dengan email di database
+
+4. **Session Management:**
+   - Session dibuat di database Supabase
+   - Cookie digunakan untuk session tracking
+   - Session expires setelah 24 jam
 
 ---
 
-## 📝 Summary
+## 🔗 Referensi
 
-1. **Token dari SSO** → Decode JWT → Extract user info (email, name, sub)
-2. **Check/create user** → Simpan di Supabase (tabel `pengguna`)
-3. **Create session** → Simpan di Supabase (tabel `sesi_login`)
-4. **Set cookie** → `client_dinas_session` = session ID
-5. **Ambil data user** → Query dari Supabase berdasarkan session
-6. **Tampilkan** → Render nama, email, dll di halaman
-
-**Jadi, data user yang ditampilkan di website client berasal dari Supabase, bukan langsung dari Keycloak. Keycloak hanya digunakan untuk authentication (verifikasi user sudah login), sedangkan data user disimpan dan diambil dari Supabase.**
-
+- **[SSO_SIMPLE_GUIDE.md](./SSO_SIMPLE_GUIDE.md)** - Panduan lengkap SSO Simple
+- **[SSO_SERVER_REQUIREMENTS.md](./SSO_SERVER_REQUIREMENTS.md)** - Requirements untuk Portal SSO
+- **[SSO_TROUBLESHOOTING.md](./SSO_TROUBLESHOOTING.md)** - Troubleshooting guide

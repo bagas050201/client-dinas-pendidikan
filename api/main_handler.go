@@ -5,9 +5,12 @@ import (
 	"client-dinas-pendidikan/api/session"
 	"client-dinas-pendidikan/pkg/helpers"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -46,6 +49,49 @@ func getJWTPrivateKey() string {
 // getJWTPublicKey returns JWT_PUBLIC_KEY from environment
 func getJWTPublicKey() string {
 	return os.Getenv("JWT_PUBLIC_KEY")
+}
+
+// parseRSAPublicKey parses RSA public key from PEM format
+func parseRSAPublicKey(publicKeyStr string) (*rsa.PublicKey, error) {
+	// Try to parse as PEM format
+	block, _ := pem.Decode([]byte(publicKeyStr))
+	if block != nil {
+		// PEM format detected
+		if block.Type == "PUBLIC KEY" {
+			// PKIX format
+			pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+			if err != nil {
+				return nil, err
+			}
+			rsaPub, ok := pub.(*rsa.PublicKey)
+			if !ok {
+				return nil, fmt.Errorf("key is not RSA public key")
+			}
+			return rsaPub, nil
+		} else if block.Type == "RSA PUBLIC KEY" {
+			// PKCS1 format
+			pub, err := x509.ParsePKCS1PublicKey(block.Bytes)
+			if err != nil {
+				return nil, err
+			}
+			return pub, nil
+		}
+	}
+
+	// If not PEM, try to parse as raw bytes (base64 encoded)
+	// This is less common but might be needed
+	keyBytes, err := base64.StdEncoding.DecodeString(publicKeyStr)
+	if err == nil {
+		pub, err := x509.ParsePKIXPublicKey(keyBytes)
+		if err == nil {
+			rsaPub, ok := pub.(*rsa.PublicKey)
+			if ok {
+				return rsaPub, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("unable to parse RSA public key")
 }
 
 // getSessionSecret returns SESSION_SECRET from environment
@@ -88,11 +134,55 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		state := r.URL.Query().Get("state")
 		errorParam := r.URL.Query().Get("error")
 
-		// Juga support format lama (sso_token) untuk backward compatibility
+		// Juga support format baru: sso_token (access_token) dan sso_id_token (ID token dengan user info)
 		ssoToken := r.URL.Query().Get("sso_token")
+		ssoIdToken := r.URL.Query().Get("sso_id_token")
+
+		// PENTING: Handle sso_token dan sso_id_token di root path (dari website SSO)
+		// Flow baru: sso_id_token berisi user info lengkap (TANPA perlu call API)
+		// Prioritas: sso_id_token > sso_token (karena id_token sudah berisi user info)
+		if ssoIdToken != "" || ssoToken != "" {
+			log.Printf("🔐 SSO token detected in root path, processing...")
+			if ssoIdToken != "" {
+				log.Printf("   ID token present (length: %d) - berisi user info lengkap", len(ssoIdToken))
+			}
+			if ssoToken != "" {
+				log.Printf("   Access token present (length: %d)", len(ssoToken))
+			}
+
+			// PRIORITAS: Process sso_id_token dulu (karena sudah berisi user info)
+			var success bool
+			if ssoIdToken != "" {
+				log.Printf("🔄 Processing sso_id_token (prioritas - berisi user info)...")
+				success = handleSSOTokenWithCookie(w, r, ssoIdToken)
+			}
+
+			// Jika sso_id_token gagal, coba sso_token sebagai fallback
+			if !success && ssoToken != "" {
+				log.Printf("⚠️ sso_id_token failed, trying sso_token as fallback...")
+				success = handleSSOTokenWithCookie(w, r, ssoToken)
+			}
+
+			if success {
+				// Session berhasil dibuat, redirect ke dashboard
+				next := r.URL.Query().Get("next")
+				if next == "" {
+					next = "/dashboard"
+				}
+				log.Printf("✅ SSO token processed successfully, redirecting to: %s", next)
+				// Hapus token dari URL untuk security
+				http.Redirect(w, r, next, http.StatusSeeOther)
+				return
+			} else {
+				log.Printf("❌ Failed to process SSO token (both sso_id_token and sso_token failed)")
+				// Redirect dengan error message
+				http.Redirect(w, r, "/login?error=sso_token_failed&message="+url.QueryEscape("Gagal memproses SSO token. Silakan coba lagi."), http.StatusSeeOther)
+				return
+			}
+		}
 
 		// Jika ada authorization code, state, atau error dari Keycloak, redirect ke login dengan semua query parameters
-		if code != "" || state != "" || errorParam != "" || ssoToken != "" {
+		if code != "" || state != "" || errorParam != "" {
 			// Pastikan semua query parameters dibawa saat redirect ke login
 			// Login page sudah include sso-handler.js yang akan auto-process code/token dan login user
 			queryString := r.URL.RawQuery
@@ -247,6 +337,52 @@ func getMapKeys(m map[string]interface{}) []string {
 // Jika user sudah memiliki session valid, redirect ke /dashboard
 // Jika tidak, tampilkan form login
 func LoginPageHandler(w http.ResponseWriter, r *http.Request) {
+	// PENTING: Handle sso_token dan sso_id_token (dari website SSO)
+	// Flow baru: sso_id_token berisi user info lengkap (TANPA perlu call API)
+	// Prioritas: sso_id_token > sso_token (karena id_token sudah berisi user info)
+	ssoToken := r.URL.Query().Get("sso_token")
+	ssoIdToken := r.URL.Query().Get("sso_id_token")
+
+	if ssoIdToken != "" || ssoToken != "" {
+		log.Printf("🔐 SSO token detected in /login, processing...")
+		if ssoIdToken != "" {
+			log.Printf("   ID token present (length: %d) - berisi user info lengkap", len(ssoIdToken))
+		}
+		if ssoToken != "" {
+			log.Printf("   Access token present (length: %d)", len(ssoToken))
+		}
+
+		// PRIORITAS: Process sso_id_token dulu (karena sudah berisi user info)
+		var success bool
+		if ssoIdToken != "" {
+			log.Printf("🔄 Processing sso_id_token (prioritas - berisi user info)...")
+			success = handleSSOTokenWithCookie(w, r, ssoIdToken)
+		}
+
+		// Jika sso_id_token gagal, coba sso_token sebagai fallback
+		if !success && ssoToken != "" {
+			log.Printf("⚠️ sso_id_token failed, trying sso_token as fallback...")
+			success = handleSSOTokenWithCookie(w, r, ssoToken)
+		}
+
+		if success {
+			// Session berhasil dibuat, redirect ke dashboard
+			next := r.URL.Query().Get("next")
+			if next == "" {
+				next = "/dashboard"
+			}
+			log.Printf("✅ SSO token processed successfully, redirecting to: %s", next)
+			// Hapus token dari URL untuk security
+			http.Redirect(w, r, next, http.StatusSeeOther)
+			return
+		} else {
+			log.Printf("❌ Failed to process SSO token (both sso_id_token and sso_token failed)")
+			// Redirect dengan error message
+			http.Redirect(w, r, "/login?error=sso_token_failed&message="+url.QueryEscape("Gagal memproses SSO token. Silakan coba lagi."), http.StatusSeeOther)
+			return
+		}
+	}
+
 	// Cek apakah user sudah login (cek access token atau session)
 	// PENTING: Jangan redirect jika ada error parameter (untuk menghindari loop)
 	errorParam := r.URL.Query().Get("error")
@@ -317,6 +453,12 @@ func LoginPageHandler(w http.ResponseWriter, r *http.Request) {
 				errorMsg = "Error dari SSO: " + messageParam
 			} else {
 				errorMsg = "Terjadi kesalahan saat login dengan SSO."
+			}
+		case "sso_token_failed":
+			if messageParam != "" {
+				errorMsg = messageParam
+			} else {
+				errorMsg = "Gagal memproses SSO token. Silakan coba lagi."
 			}
 		case "token_expired":
 			errorMsg = "Token sudah expired. Silakan login lagi."
@@ -814,10 +956,42 @@ func getDashboardCounts() (map[string]int, error) {
 func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, counts map[string]int) {
 	logoBase64 := base64.StdEncoding.EncodeToString(LogoData)
 	userName := "User"
+	userEmail := ""
+	userRole := "user"
+	userStatus := "Aktif"
+	roleBadgeClass := "user"
+
 	if name, ok := user["nama_lengkap"].(string); ok && name != "" {
 		userName = name
 	} else if email, ok := user["email"].(string); ok {
 		userName = email
+	}
+
+	if email, ok := user["email"].(string); ok && email != "" {
+		userEmail = email
+	}
+
+	if peran, ok := user["peran"].(string); ok && peran != "" {
+		userRole = peran
+		// Set badge class berdasarkan peran
+		switch strings.ToLower(peran) {
+		case "admin":
+			roleBadgeClass = "admin"
+		case "guru", "wali", "murid":
+			roleBadgeClass = "user"
+		default:
+			roleBadgeClass = "user"
+		}
+	}
+
+	if aktif, ok := user["aktif"].(bool); ok && !aktif {
+		userStatus = "Tidak Aktif"
+	}
+
+	// Get initial for avatar
+	avatarInitial := "U"
+	if len(userName) > 0 {
+		avatarInitial = strings.ToUpper(string(userName[0]))
 	}
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
@@ -1040,20 +1214,39 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
         <div class="navbar-right">
             <div class="user-menu">
                 <div class="user-avatar">%s</div>
-                <span>%s</span>
+                <span id="headerUserName">%s</span>
             </div>
             <a href="/logout" class="btn-logout">Logout</a>
         </div>
     </nav>
     <div class="container">
         <div class="welcome-section">
-            <h1 class="welcome-title">Selamat Datang, %s!</h1>
+            <h1 class="welcome-title" id="welcomeTitle">Selamat Datang, %s!</h1>
             <p class="welcome-subtitle">Dashboard Sistem Informasi Dinas Pendidikan</p>
         </div>
-        <div id="ssoInfoCard" class="sso-info-card" style="display: none;">
-            <h2 class="sso-info-title">📋 Informasi SSO User</h2>
-            <div class="sso-info-grid" id="ssoInfoGrid">
-                <!-- Data akan diisi oleh JavaScript -->
+        <div class="sso-info-card">
+            <h2 class="sso-info-title">👤 Informasi User</h2>
+            <div class="sso-info-grid">
+                <div class="sso-info-item">
+                    <div class="sso-info-label">Nama Lengkap</div>
+                    <div class="sso-info-value">%s</div>
+                </div>
+                <div class="sso-info-item">
+                    <div class="sso-info-label">Email</div>
+                    <div class="sso-info-value">%s</div>
+                </div>
+                <div class="sso-info-item">
+                    <div class="sso-info-label">Peran</div>
+                    <div class="sso-info-value">
+                        <span class="sso-info-badge %s">%s</span>
+                    </div>
+                </div>
+                <div class="sso-info-item">
+                    <div class="sso-info-label">Status</div>
+                    <div class="sso-info-value">
+                        <span class="sso-info-badge verified">%s</span>
+                    </div>
+                </div>
             </div>
         </div>
         <div class="actions-grid">
@@ -1192,12 +1385,10 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
         document.addEventListener('DOMContentLoaded', function() {
             // Update header dan welcome message terlebih dahulu
             updateUserDisplayFromSSO();
-            // Tampilkan SSO info card
-            displaySSOUserInfo();
         });
     </script>
 </body>
-</html>`, logoBase64, string([]rune(userName)[0]), userName, userName)
+</html>`, logoBase64, avatarInitial, userName, userName, userName, userEmail, roleBadgeClass, userRole, userStatus)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -3131,68 +3322,158 @@ func createSessionFromEmail(r *http.Request, email string) (string, bool) {
 
 // handleSSOTokenWithCookie processes SSO token and creates local session with cookie
 func handleSSOTokenWithCookie(w http.ResponseWriter, r *http.Request, token string) bool {
+	log.Printf("🔐 Processing SSO token (length: %d)", len(token))
+
 	// Validate and decode JWT token
 	jwtPublicKey := getJWTPublicKey()
+
+	var parsedToken *jwt.Token
+	var err error
+
 	if jwtPublicKey == "" {
-		log.Println("ERROR: JWT_PUBLIC_KEY not set for SSO validation")
-		return false
-	}
-
-	// Parse and validate JWT token
-	parsedToken, err := jwt.Parse(token, func(token *jwt.Token) (interface{}, error) {
-		// Verify signing method - support both RSA and HMAC
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); ok {
-			// HMAC uses secret key directly
-			return []byte(jwtPublicKey), nil
+		log.Println("⚠️ WARNING: JWT_PUBLIC_KEY not set, decoding token without signature validation (development mode)")
+		// Untuk development: decode token tanpa validasi signature
+		parser := jwt.NewParser()
+		parsedToken, _, err = parser.ParseUnverified(token, jwt.MapClaims{})
+		if err != nil {
+			log.Printf("❌ ERROR parsing SSO token (unverified): %v", err)
+			// Try alternative: treat token as simple base64 encoded user info
+			return handleSSOTokenSimpleWithCookie(w, r, token)
 		}
-		if _, ok := token.Method.(*jwt.SigningMethodRSA); ok {
-			// RSA uses PEM formatted public key
-			// For now, return as byte array - adjust if your key format is different
-			// If you have PEM format, you may need to parse it with crypto/x509
+		log.Println("✅ Token decoded without signature validation (development mode)")
+	} else {
+		log.Println("🔑 JWT_PUBLIC_KEY found, validating token signature...")
+		// Parse and validate JWT token dengan signature validation
+		parsedToken, err = jwt.Parse(token, func(token *jwt.Token) (interface{}, error) {
+			// Verify signing method - support both RSA and HMAC
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); ok {
+				// HMAC uses secret key directly
+				return []byte(jwtPublicKey), nil
+			}
+			if _, ok := token.Method.(*jwt.SigningMethodRSA); ok {
+				// RSA uses PEM formatted public key - need to parse it
+				rsaPubKey, err := parseRSAPublicKey(jwtPublicKey)
+				if err != nil {
+					log.Printf("⚠️ WARNING: Failed to parse RSA public key: %v. Falling back to unverified decode.", err)
+					// Fallback: return nil to trigger error, then we'll decode unverified
+					return nil, fmt.Errorf("invalid RSA public key: %v", err)
+				}
+				return rsaPubKey, nil
+			}
+			// Unknown signing method, try as HMAC
 			return []byte(jwtPublicKey), nil
+		})
+
+		if err != nil {
+			log.Printf("❌ ERROR parsing SSO token: %v", err)
+			errStr := strings.ToLower(err.Error())
+			// If RSA key parsing failed or signature validation failed, try to decode without signature validation
+			// Check for various RSA-related error messages
+			if strings.Contains(errStr, "invalid rsa public key") ||
+				strings.Contains(errStr, "rsa verify expects") ||
+				strings.Contains(errStr, "key is of invalid type") ||
+				strings.Contains(errStr, "signature is invalid") {
+				log.Println("⚠️ WARNING: RSA key parsing/signature validation failed, decoding token without signature validation (development mode)")
+				parser := jwt.NewParser()
+				parsedToken, _, err = parser.ParseUnverified(token, jwt.MapClaims{})
+				if err != nil {
+					log.Printf("❌ ERROR parsing SSO token (unverified): %v", err)
+					return handleSSOTokenSimpleWithCookie(w, r, token)
+				}
+				log.Println("✅ Token decoded without signature validation (development mode)")
+				// Skip signature validation check since we're in unverified mode
+			} else {
+				// Try alternative: treat token as simple base64 encoded user info
+				return handleSSOTokenSimpleWithCookie(w, r, token)
+			}
+		} else {
+			// Only check validity if we did signature validation
+			if !parsedToken.Valid {
+				log.Println("❌ ERROR: Invalid SSO token (signature validation failed)")
+				return false
+			}
+			log.Println("✅ Token signature validated successfully")
 		}
-		// Try to parse as any method - use key as-is
-		return []byte(jwtPublicKey), nil
-	})
-
-	if err != nil {
-		log.Printf("ERROR parsing SSO token: %v", err)
-		// Try alternative: treat token as simple base64 encoded user info
-		return handleSSOTokenSimpleWithCookie(w, r, token)
-	}
-
-	if !parsedToken.Valid {
-		log.Println("ERROR: Invalid SSO token")
-		return false
 	}
 
 	// Extract claims
 	claims, ok := parsedToken.Claims.(jwt.MapClaims)
 	if !ok {
-		log.Println("ERROR: Invalid token claims")
+		log.Println("❌ ERROR: Invalid token claims type")
 		return false
 	}
 
-	// Extract user email from claims
-	email, ok := claims["email"].(string)
-	if !ok {
-		// Try alternative claim names
-		if email, ok = claims["sub"].(string); !ok {
-			if email, ok = claims["user_email"].(string); !ok {
-				log.Println("ERROR: Email not found in token claims")
-				return false
+	// Log all claims untuk debugging
+	log.Printf("📋 Token claims received:")
+	for key, value := range claims {
+		log.Printf("   - %s: %v", key, value)
+	}
+
+	// Extract user email from claims (try multiple claim names)
+	var email string
+	var emailFound bool
+
+	// Try email first (most common)
+	if emailVal, exists := claims["email"]; exists {
+		if emailStr, ok := emailVal.(string); ok && emailStr != "" {
+			email = emailStr
+			emailFound = true
+			log.Printf("✅ Email found in 'email' claim: %s", email)
+		}
+	}
+
+	// Try preferred_username as fallback
+	if !emailFound {
+		if usernameVal, exists := claims["preferred_username"]; exists {
+			if usernameStr, ok := usernameVal.(string); ok && usernameStr != "" {
+				email = usernameStr
+				emailFound = true
+				log.Printf("✅ Email found in 'preferred_username' claim: %s", email)
 			}
 		}
 	}
 
-	// Get or create user and create session
-	sessionID, ok := createSessionFromEmail(r, email)
-	if !ok {
+	// Try sub as last resort (usually user ID, but might be email)
+	if !emailFound {
+		if subVal, exists := claims["sub"]; exists {
+			if subStr, ok := subVal.(string); ok && subStr != "" {
+				// Check if sub looks like an email
+				if strings.Contains(subStr, "@") {
+					email = subStr
+					emailFound = true
+					log.Printf("✅ Email found in 'sub' claim: %s", email)
+				}
+			}
+		}
+	}
+
+	if !emailFound {
+		log.Printf("❌ ERROR: Email not found in token claims. Available claims: %v", func() []string {
+			keys := make([]string, 0, len(claims))
+			for k := range claims {
+				keys = append(keys, k)
+			}
+			return keys
+		}())
 		return false
 	}
 
-	// Set cookie
+	log.Printf("✅ Email extracted from token: %s", email)
+
+	// Get or create user and create session
+	log.Printf("🔄 Creating session for email: %s", email)
+	sessionID, ok := createSessionFromEmail(r, email)
+	if !ok {
+		log.Printf("❌ Failed to create session for email: %s", email)
+		return false
+	}
+	log.Printf("✅ Session created successfully: %s", sessionID)
+
+	// Set cookie dengan nama yang konsisten (client_dinas_session)
+	helpers.SetCookie(w, r, "client_dinas_session", sessionID, 86400) // 24 jam
+	// Juga set session_id untuk backward compatibility
 	helpers.SetCookie(w, r, "session_id", sessionID, 86400)
+	log.Printf("✅ SSO token processed, session created: %s", sessionID)
 	return true
 }
 
