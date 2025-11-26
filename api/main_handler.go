@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"database/sql"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	_ "github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -49,6 +51,66 @@ func getJWTPrivateKey() string {
 // getJWTPublicKey returns JWT_PUBLIC_KEY from environment
 func getJWTPublicKey() string {
 	return os.Getenv("JWT_PUBLIC_KEY")
+}
+
+// PostgreSQL connection functions
+func getPostgresHost() string {
+	if host := os.Getenv("POSTGRES_HOST"); host != "" {
+		return host
+	}
+	return "localhost" // default
+}
+
+func getPostgresPort() string {
+	if port := os.Getenv("POSTGRES_PORT"); port != "" {
+		return port
+	}
+	return "5433" // default
+}
+
+func getPostgresDB() string {
+	if db := os.Getenv("POSTGRES_DB"); db != "" {
+		return db
+	}
+	return "dinas_pendidikan" // default
+}
+
+func getPostgresUser() string {
+	if user := os.Getenv("POSTGRES_USER"); user != "" {
+		return user
+	}
+	return "postgres" // default
+}
+
+func getPostgresPassword() string {
+	if password := os.Getenv("POSTGRES_PASSWORD"); password != "" {
+		return password
+	}
+	return "postgres123" // default
+}
+
+// connectPostgreSQL creates a connection to local PostgreSQL database
+func connectPostgreSQL() (*sql.DB, error) {
+	host := getPostgresHost()
+	port := getPostgresPort()
+	dbname := getPostgresDB()
+	user := getPostgresUser()
+	password := getPostgresPassword()
+
+	psqlInfo := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		host, port, user, password, dbname)
+
+	db, err := sql.Open("postgres", psqlInfo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open PostgreSQL connection: %v", err)
+	}
+
+	err = db.Ping()
+	if err != nil {
+		return nil, fmt.Errorf("failed to ping PostgreSQL database: %v", err)
+	}
+
+	return db, nil
 }
 
 // parseRSAPublicKey parses RSA public key from PEM format
@@ -3220,53 +3282,144 @@ func checkSSOSessionWithCookie(w http.ResponseWriter, r *http.Request) bool {
 }
 
 // createSessionFromEmail gets user from database and creates local session
-func createSessionFromEmail(r *http.Request, email string) (string, bool) {
-	supabaseURL := getSupabaseURL()
-	supabaseKey := getSupabaseKey()
-	if supabaseURL == "" || supabaseKey == "" {
-		log.Println("ERROR: Supabase not configured")
-		return "", false
+// getUserFromPostgreSQL looks up user from local PostgreSQL database
+func getUserFromPostgreSQL(email string) (map[string]interface{}, error) {
+	db, err := connectPostgreSQL()
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to PostgreSQL: %v", err)
+	}
+	defer db.Close()
+
+	// Query user from PostgreSQL
+	// Based on actual schema: id_pengguna, nama_pengguna, email, nama_lengkap, peran, password, aktif, created_at, updated_at
+	query := `SELECT id_pengguna, email, nama_lengkap, peran, aktif FROM pengguna WHERE email = $1 AND aktif = true`
+
+	var user struct {
+		ID          string `json:"id_pengguna"`
+		Email       string `json:"email"`
+		NamaLengkap string `json:"nama_lengkap"`
+		Peran       string `json:"peran"`
+		Aktif       bool   `json:"aktif"`
 	}
 
-	// Get user from database
+	err = db.QueryRow(query, email).Scan(
+		&user.ID,
+		&user.Email,
+		&user.NamaLengkap,
+		&user.Peran,
+		&user.Aktif,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("user not found")
+		}
+		return nil, fmt.Errorf("database query error: %v", err)
+	}
+
+	// Convert to map[string]interface{} format for compatibility
+	userMap := map[string]interface{}{
+		"id_pengguna":  user.ID,
+		"email":        user.Email,
+		"nama_lengkap": user.NamaLengkap,
+		"peran":        user.Peran,
+		"aktif":        user.Aktif,
+	}
+
+	return userMap, nil
+}
+
+// ensureUserInSupabase creates user in Supabase if not exists (for session foreign key)
+func ensureUserInSupabase(user map[string]interface{}, supabaseURL, supabaseKey string) error {
+	// Check if user already exists in Supabase
+	email := user["email"].(string)
 	emailEncoded := url.QueryEscape(email)
-	apiURL := fmt.Sprintf("%s/rest/v1/pengguna?email=eq.%s&select=*", supabaseURL, emailEncoded)
+	checkURL := fmt.Sprintf("%s/rest/v1/pengguna?email=eq.%s&select=id_pengguna", supabaseURL, emailEncoded)
 
-	httpReq, err := http.NewRequest("GET", apiURL, nil)
+	checkReq, err := http.NewRequest("GET", checkURL, nil)
 	if err != nil {
-		log.Printf("ERROR creating request: %v", err)
-		return "", false
+		return fmt.Errorf("error creating check request: %v", err)
 	}
 
-	httpReq.Header.Set("apikey", supabaseKey)
-	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
-	httpReq.Header.Set("Content-Type", "application/json")
+	checkReq.Header.Set("apikey", supabaseKey)
+	checkReq.Header.Set("Authorization", "Bearer "+supabaseKey)
+	checkReq.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := http.DefaultClient.Do(checkReq)
 	if err != nil {
-		log.Printf("ERROR calling Supabase: %v", err)
-		return "", false
+		return fmt.Errorf("error checking user in Supabase: %v", err)
 	}
 	defer resp.Body.Close()
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("ERROR Supabase response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
+		return fmt.Errorf("Supabase check error: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var existingUsers []map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &existingUsers); err != nil {
+		return fmt.Errorf("error parsing check response: %v", err)
+	}
+
+	// If user already exists, no need to create
+	if len(existingUsers) > 0 {
+		log.Printf("✅ User already exists in Supabase")
+		return nil
+	}
+
+	// Create user in Supabase
+	log.Printf("🔄 Creating user in Supabase for session storage...")
+	userData := map[string]interface{}{
+		"id_pengguna":  user["id_pengguna"],
+		"email":        user["email"],
+		"nama_lengkap": user["nama_lengkap"],
+		"peran":        user["peran"],
+		"aktif":        user["aktif"],
+		"password":     "$2a$10$dummy.hash.for.sso.user", // Dummy password hash for SSO users
+	}
+
+	userJSON, _ := json.Marshal(userData)
+	createURL := fmt.Sprintf("%s/rest/v1/pengguna", supabaseURL)
+	createReq, err := http.NewRequest("POST", createURL, bytes.NewBuffer(userJSON))
+	if err != nil {
+		return fmt.Errorf("error creating user request: %v", err)
+	}
+
+	createReq.Header.Set("apikey", supabaseKey)
+	createReq.Header.Set("Authorization", "Bearer "+supabaseKey)
+	createReq.Header.Set("Content-Type", "application/json")
+	createReq.Header.Set("Prefer", "return=representation")
+
+	resp, err = http.DefaultClient.Do(createReq)
+	if err != nil {
+		return fmt.Errorf("error creating user in Supabase: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Supabase create error: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	log.Printf("✅ User created in Supabase for session storage")
+	return nil
+}
+
+func createSessionFromEmail(r *http.Request, email string) (string, bool) {
+	log.Printf("🔄 Creating session for email: %s", email)
+
+	// Get user from PostgreSQL database
+	log.Printf("🔍 Checking PostgreSQL database for user: %s", email)
+	pgUser, err := getUserFromPostgreSQL(email)
+	if err != nil {
+		log.Printf("❌ User not found in PostgreSQL: %v", err)
+		log.Printf("❌ User with email %s not found in database", email)
 		return "", false
 	}
 
-	var users []map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &users); err != nil {
-		log.Printf("ERROR parsing response: %v", err)
-		return "", false
-	}
-
-	if len(users) == 0 {
-		log.Printf("WARNING: User with email %s not found in database", email)
-		return "", false
-	}
-
-	user := users[0]
+	user := pgUser
+	log.Printf("✅ User found in PostgreSQL database: %s", email)
+	log.Printf("📋 User found in PostgreSQL - Name: %v, Role: %v", user["nama_lengkap"], user["peran"])
 
 	// Check if user is active
 	if active, ok := user["aktif"].(bool); !ok || !active {
@@ -3296,9 +3449,27 @@ func createSessionFromEmail(r *http.Request, email string) (string, bool) {
 		"kadaluarsa":  expiresAt.Format(time.RFC3339), // expires_at → kadaluarsa
 	}
 
+	// Create session in Supabase for session storage
+	supabaseURL := getSupabaseURL()
+	supabaseKey := getSupabaseKey()
+	if supabaseURL == "" || supabaseKey == "" {
+		log.Println("ERROR: Supabase not configured for session storage")
+		return "", false
+	}
+
+	// Ensure user exists in Supabase for session storage
+	log.Printf("🔄 Ensuring user exists in Supabase for session storage...")
+	err = ensureUserInSupabase(user, supabaseURL, supabaseKey)
+	if err != nil {
+		log.Printf("⚠️ Failed to ensure user in Supabase: %v", err)
+		log.Printf("🔄 Creating session without foreign key constraint...")
+		// Use email as id_pengguna to avoid FK constraint issues
+		sessionData["id_pengguna"] = user["email"]
+	}
+
 	sessionJSON, _ := json.Marshal(sessionData)
-	apiURL = fmt.Sprintf("%s/rest/v1/sesi_login", supabaseURL)
-	httpReq, err = http.NewRequest("POST", apiURL, bytes.NewBuffer(sessionJSON))
+	apiURL := fmt.Sprintf("%s/rest/v1/sesi_login", supabaseURL)
+	httpReq, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(sessionJSON))
 	if err != nil {
 		log.Printf("ERROR creating session request: %v", err)
 		return "", false
@@ -3309,12 +3480,20 @@ func createSessionFromEmail(r *http.Request, email string) (string, bool) {
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Prefer", "return=representation")
 
-	resp, err = http.DefaultClient.Do(httpReq)
+	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
 		log.Printf("ERROR creating session: %v", err)
 		return "", false
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		log.Printf("ERROR creating session in Supabase: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
+		return "", false
+	}
+
+	log.Printf("✅ Session created successfully for user from PostgreSQL")
 
 	// Return session ID for cookie setting
 	return sessionID, true

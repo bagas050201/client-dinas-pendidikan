@@ -54,60 +54,68 @@ cp .env.example .env
 
 Edit `.env` dan isi dengan:
 ```
+# PostgreSQL Configuration (Database Utama)
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5433
+POSTGRES_DB=dinas_pendidikan
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgres123
+
+# Supabase Configuration (untuk session storage)
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_KEY=your-anon-key
+
+# JWT Configuration (Optional)
 JWT_PUBLIC_KEY=your-jwt-public-key  # Optional: untuk signature validation (development mode jika tidak di-set)
+
+# Server Configuration
 PORT=8070
 ```
 
-4. Setup database di Supabase:
+4. Setup database di PostgreSQL:
+Buat database dan tabel di PostgreSQL:
+
+```sql
+-- Connect ke PostgreSQL
+psql -h localhost -p 5433 -U postgres
+
+-- Create database
+CREATE DATABASE dinas_pendidikan;
+
+-- Connect ke database
+\c dinas_pendidikan;
+
+-- Create table pengguna
+CREATE TABLE pengguna (
+    id_pengguna UUID PRIMARY KEY,
+    nama_pengguna VARCHAR(100),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    nama_lengkap VARCHAR(255) NOT NULL,
+    peran VARCHAR(50) NOT NULL,
+    password VARCHAR(255),
+    aktif BOOLEAN DEFAULT true,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Insert test user
+INSERT INTO pengguna (id_pengguna, nama_pengguna, email, nama_lengkap, peran, aktif) VALUES 
+('05374820-444f-45a4-b9e1-487284b35206', 'admin', 'admin@dinas-pendidikan.go.id', 'Administrator', 'admin', true);
+```
+
+5. Setup session storage di Supabase:
 Jalankan SQL berikut di Supabase SQL Editor:
 
 ```sql
--- Table: pengguna
-CREATE TABLE pengguna (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    nama_lengkap TEXT NOT NULL,
-    peran TEXT NOT NULL CHECK (peran IN ('guru', 'wali', 'murid', 'admin', 'user')),
-    aktif BOOLEAN DEFAULT true,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-);
-
--- Table: sesi_login
+-- Table: sesi_login (untuk session storage)
 CREATE TABLE sesi_login (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID REFERENCES pengguna(id) ON DELETE CASCADE,
-    session_id TEXT UNIQUE NOT NULL,
-    ip_address TEXT,
+    id_pengguna TEXT NOT NULL,
+    id_sesi TEXT UNIQUE NOT NULL,
+    ip TEXT,
     user_agent TEXT,
-    created_at TIMESTAMP DEFAULT NOW(),
-    expires_at TIMESTAMP NOT NULL
-);
-
--- Table: berita
-CREATE TABLE berita (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    judul TEXT NOT NULL,
-    konten TEXT NOT NULL,
-    kategori TEXT NOT NULL,
-    penulis_id UUID REFERENCES pengguna(id),
-    published BOOLEAN DEFAULT false,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-);
-
--- Table: pengumuman
-CREATE TABLE pengumuman (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    judul TEXT NOT NULL,
-    konten TEXT NOT NULL,
-    prioritas TEXT DEFAULT 'normal' CHECK (prioritas IN ('low', 'normal', 'high', 'urgent')),
-    published BOOLEAN DEFAULT false,
-    created_at TIMESTAMP DEFAULT NOW(),
-    expires_at TIMESTAMP
+    kadaluarsa TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
 );
 ```
 
@@ -155,6 +163,8 @@ vercel --prod
 
 - ✅ Authentication (Login/Register)
 - ✅ SSO Integration (SSO Simple - token-based)
+- ✅ **PostgreSQL Database** (User authentication dan data)
+- ✅ **Supabase Integration** (Session storage)
 - ✅ Session Management
 - ✅ Home Page dengan pengumuman
 - ✅ About Page
@@ -212,6 +222,7 @@ client-dinas-pendidikan/
 - **[SSO_SERVER_REQUIREMENTS.md](./SSO_SERVER_REQUIREMENTS.md)** - Requirements untuk Portal SSO (SSO Simple)
 - **[SSO_TROUBLESHOOTING.md](./SSO_TROUBLESHOOTING.md)** - Troubleshooting guide untuk SSO Simple
 - **[SSO_USER_DATA_FLOW.md](./SSO_USER_DATA_FLOW.md)** - Flow mendapatkan data user dari SSO (SSO Simple)
+- **[POSTGRESQL_SETUP.md](./POSTGRESQL_SETUP.md)** 🔄 - Setup PostgreSQL database
 
 ### 📚 Legacy Documentation (Authorization Code Flow)
 
