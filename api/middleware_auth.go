@@ -1,4 +1,4 @@
-package api
+package main
 
 import (
 	"client-dinas-pendidikan/pkg/helpers"

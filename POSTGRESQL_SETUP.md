@@ -11,16 +11,12 @@ Website client menggunakan **PostgreSQL** sebagai database utama untuk user auth
 Tambahkan ke `.env`:
 
 ```bash
-# PostgreSQL Configuration
+# PostgreSQL Configuration (Database Utama & Session Storage)
 POSTGRES_HOST=localhost
 POSTGRES_PORT=5433
 POSTGRES_DB=dinas_pendidikan
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres123
-
-# Supabase Configuration (untuk session storage saja)
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_KEY=your-anon-key
 
 # JWT Configuration (Optional)
 JWT_PUBLIC_KEY=your-jwt-public-key
@@ -61,7 +57,7 @@ INSERT INTO pengguna (id_pengguna, nama_pengguna, email, nama_lengkap, peran, ak
 ```
 1. SSO Login → Extract email dari token
 2. Lookup user di PostgreSQL berdasarkan email
-3. Jika ditemukan → Create session di Supabase
+3. Jika ditemukan → Create session di PostgreSQL
 4. Redirect ke dashboard
 ```
 
@@ -83,9 +79,25 @@ if err == nil {
 
 ### 2. Session Storage
 
-**Session disimpan di Supabase** untuk konsistensi dengan sistem lain:
-- User dari PostgreSQL → Session di Supabase
-- Sistem otomatis sync user ke Supabase jika diperlukan
+**Session disimpan di PostgreSQL** yang sama dengan user data:
+- User dari PostgreSQL → Session di PostgreSQL (same database)
+- Tidak perlu database terpisah, semua dalam satu PostgreSQL
+
+#### PostgreSQL Schema untuk Session:
+```sql
+-- Table: sesi_login (untuk session storage)
+CREATE TABLE IF NOT EXISTS sesi_login (
+    id SERIAL PRIMARY KEY,
+    id_pengguna VARCHAR(255) NOT NULL,  -- Menyimpan UUID sebagai string
+    id_sesi VARCHAR(255) UNIQUE NOT NULL,
+    ip VARCHAR(45),
+    user_agent TEXT,
+    kadaluarsa TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+**Catatan:** `id_pengguna` menggunakan VARCHAR untuk menyimpan UUID sebagai string, tanpa foreign key constraint untuk menghindari masalah kompatibilitas.
 
 ### 3. Log Output
 
@@ -142,13 +154,13 @@ psql -h localhost -p 5433 -U postgres -d dinas_pendidikan
 1. Buat user di PostgreSQL dengan email yang sesuai
 2. Pastikan field `aktif = true`
 
-### Error: "Supabase session error"
+### Error: "PostgreSQL session error"
 
-**Penyebab:** Session storage ke Supabase gagal.
+**Penyebab:** Session storage ke PostgreSQL gagal.
 
 **Solusi:**
-1. Set environment variables Supabase
-2. Supabase diperlukan untuk session storage
+1. Pastikan tabel `sesi_login` sudah dibuat
+2. Cek foreign key constraint antara `sesi_login` dan `pengguna`
 
 ## 📊 Database Structure
 

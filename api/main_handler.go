@@ -1,4 +1,4 @@
-package api
+package main
 
 import (
 	"bytes"
@@ -175,7 +175,9 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	// Serve static JavaScript files
 	if path == "/static/sso-handler.js" || path == "/sso-handler.js" {
 		w.Header().Set("Content-Type", "application/javascript")
-		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
 		w.Write(SSOHandlerJS)
 		return
 	}
@@ -226,14 +228,36 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if success {
-				// Session berhasil dibuat, redirect ke dashboard
+				// Session berhasil dibuat, render halaman sukses dengan JavaScript redirect
 				next := r.URL.Query().Get("next")
 				if next == "" {
 					next = "/dashboard"
 				}
-				log.Printf("✅ SSO token processed successfully, redirecting to: %s", next)
-				// Hapus token dari URL untuk security
-				http.Redirect(w, r, next, http.StatusSeeOther)
+				log.Printf("✅ SSO token processed successfully, rendering success page with redirect to: %s", next)
+
+				// Render halaman sukses dengan JavaScript redirect (untuk memastikan cookie ter-set)
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				successHTML := fmt.Sprintf(`
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SSO Login Berhasil</title>
+    <meta charset="utf-8">
+</head>
+<body>
+    <div style="text-align: center; padding: 50px; font-family: Arial, sans-serif;">
+        <h2>✅ Login SSO Berhasil!</h2>
+        <p>Redirecting to dashboard...</p>
+        <script>
+            console.log('🔄 SSO login success, redirecting to dashboard...');
+            setTimeout(function() {
+                window.location.href = '%s';
+            }, 1000);
+        </script>
+    </div>
+</body>
+</html>`, next)
+				w.Write([]byte(successHTML))
 				return
 			} else {
 				log.Printf("❌ Failed to process SSO token (both sso_id_token and sso_token failed)")
@@ -428,14 +452,36 @@ func LoginPageHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if success {
-			// Session berhasil dibuat, redirect ke dashboard
+			// Session berhasil dibuat, render halaman sukses dengan JavaScript redirect
 			next := r.URL.Query().Get("next")
 			if next == "" {
 				next = "/dashboard"
 			}
-			log.Printf("✅ SSO token processed successfully, redirecting to: %s", next)
-			// Hapus token dari URL untuk security
-			http.Redirect(w, r, next, http.StatusSeeOther)
+			log.Printf("✅ SSO token processed successfully, rendering success page with redirect to: %s", next)
+
+			// Render halaman sukses dengan JavaScript redirect (untuk memastikan cookie ter-set)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			successHTML := fmt.Sprintf(`
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SSO Login Berhasil</title>
+    <meta charset="utf-8">
+</head>
+<body>
+    <div style="text-align: center; padding: 50px; font-family: Arial, sans-serif;">
+        <h2>✅ Login SSO Berhasil!</h2>
+        <p>Redirecting to dashboard...</p>
+        <script>
+            console.log('🔄 SSO login success, redirecting to dashboard...');
+            setTimeout(function() {
+                window.location.href = '%s';
+            }, 1000);
+        </script>
+    </div>
+</body>
+</html>`, next)
+			w.Write([]byte(successHTML))
 			return
 		} else {
 			log.Printf("❌ Failed to process SSO token (both sso_id_token and sso_token failed)")
@@ -543,13 +589,14 @@ func LoginPageHandler(w http.ResponseWriter, r *http.Request) {
 // Flow:
 // 1. Parse email dan password dari request
 // 2. Validasi input
-// 3. Cek user di Supabase (tabel pengguna)
+// 3. Cek user di PostgreSQL (tabel pengguna)
 // 4. Verifikasi password (bcrypt atau plain text fallback)
 // 5. Cek status aktif user
 // 6. Buat session di database (tabel sesi_login)
-// 7. Set cookie sso_admin_session
+// 7. Set cookie client_dinas_session
 // 8. Redirect ke /dashboard (atau next param) atau return JSON jika Accept: application/json
 func LoginPostHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("🔐 LoginPostHandler: POST request received from %s", r.RemoteAddr)
 	// Parse request body
 	var req struct {
 		Email    string `json:"email"`
@@ -589,59 +636,46 @@ func LoginPostHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validasi koneksi Supabase
-	supabaseURL := os.Getenv("SUPABASE_URL")
-	supabaseKey := os.Getenv("SUPABASE_KEY")
-	if supabaseURL == "" || supabaseKey == "" {
-		log.Println("ERROR: SUPABASE_URL atau SUPABASE_KEY tidak di-set")
-		helpers.WriteError(w, http.StatusInternalServerError, "Konfigurasi server tidak lengkap")
-		return
-	}
+	// Ambil user dari PostgreSQL database
+	log.Printf("🔍 LoginPostHandler: authenticating user: %s", req.Email)
 
-	// Ambil user dari Supabase
-	emailEncoded := url.QueryEscape(req.Email)
-	apiURL := fmt.Sprintf("%s/rest/v1/pengguna?email=eq.%s&select=*", supabaseURL, emailEncoded)
-
-	httpReq, err := http.NewRequest("GET", apiURL, nil)
+	db, err := connectPostgreSQL()
 	if err != nil {
-		log.Printf("ERROR creating request: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Terjadi kesalahan")
-		return
-	}
-
-	httpReq.Header.Set("apikey", supabaseKey)
-	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		log.Printf("ERROR calling Supabase: %v", err)
+		log.Printf("❌ LoginPostHandler: failed to connect to PostgreSQL: %v", err)
 		helpers.WriteError(w, http.StatusInternalServerError, "Gagal terhubung ke database")
 		return
 	}
-	defer resp.Body.Close()
+	defer db.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("ERROR Supabase response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
+	// Query user from PostgreSQL
+	query := `SELECT id_pengguna, email, nama_lengkap, peran, aktif, password FROM pengguna WHERE email = $1`
+
+	var user map[string]interface{}
+	var idPengguna, email, namaLengkap, peran, password string
+	var aktif bool
+
+	err = db.QueryRow(query, req.Email).Scan(&idPengguna, &email, &namaLengkap, &peran, &aktif, &password)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Printf("❌ LoginPostHandler: user not found: %s", req.Email)
+			helpers.WriteError(w, http.StatusUnauthorized, "Email atau password salah")
+			return
+		}
+		log.Printf("❌ LoginPostHandler: error querying user: %v", err)
 		helpers.WriteError(w, http.StatusInternalServerError, "Gagal mengambil data pengguna")
 		return
 	}
 
-	var users []map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &users); err != nil {
-		log.Printf("ERROR parsing response: %v, Body: %s", err, string(bodyBytes))
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal memproses data")
-		return
+	user = map[string]interface{}{
+		"id_pengguna":  idPengguna,
+		"email":        email,
+		"nama_lengkap": namaLengkap,
+		"peran":        peran,
+		"aktif":        aktif,
+		"password":     password,
 	}
 
-	if len(users) == 0 {
-		log.Printf("ERROR: User tidak ditemukan: %s", req.Email)
-		helpers.WriteError(w, http.StatusUnauthorized, "Email atau password salah")
-		return
-	}
-
-	user := users[0]
+	log.Printf("✅ LoginPostHandler: found user: %s (%s)", namaLengkap, email)
 
 	// Verifikasi password
 	var passwordMatch bool
@@ -672,30 +706,40 @@ func LoginPostHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Buat session di database
-	// Schema Supabase: id_pengguna adalah primary key, bukan id
-	userID, ok := user["id_pengguna"]
-	if !ok {
-		// Fallback: coba id jika id_pengguna tidak ada (untuk backward compatibility)
-		userID, ok = user["id"]
-		if !ok {
-			log.Printf("ERROR: User tidak memiliki kolom id_pengguna atau id. User keys: %v", getMapKeys(user))
-			helpers.WriteError(w, http.StatusInternalServerError, "Data user tidak valid")
-			return
-		}
-	}
+	// Buat session di PostgreSQL database
+	userID := user["id_pengguna"].(string)
+	log.Printf("🔍 LoginPostHandler: creating session for userID: %s", userID)
 
-	// Log untuk debugging
-	log.Printf("🔍 Creating session for userID: %v (type: %T)", userID, userID)
-
-	sessionID, err := session.CreateSession(userID, r)
+	// Generate session ID
+	sessionID, err := helpers.GenerateSessionID()
 	if err != nil {
-		log.Printf("ERROR creating session: %v", err)
-		// Log error detail untuk debugging
-		log.Printf("ERROR detail - userID: %v, userID type: %T", userID, userID)
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal membuat sesi: "+err.Error())
+		log.Printf("❌ LoginPostHandler: failed to generate session ID: %v", err)
+		helpers.WriteError(w, http.StatusInternalServerError, "Gagal membuat session ID")
 		return
 	}
+
+	// Create session in PostgreSQL
+	expiresAt := time.Now().Add(24 * time.Hour)
+	ip := r.RemoteAddr
+	userAgent := r.Header.Get("User-Agent")
+
+	// Ensure session table exists
+	if err := createSessionTableIfNotExists(); err != nil {
+		log.Printf("❌ LoginPostHandler: failed to ensure session table: %v", err)
+		helpers.WriteError(w, http.StatusInternalServerError, "Gagal menyiapkan database")
+		return
+	}
+
+	// Insert session into PostgreSQL
+	insertQuery := `INSERT INTO sesi_login (id_pengguna, id_sesi, ip, user_agent, kadaluarsa) VALUES ($1, $2, $3, $4, $5)`
+	_, err = db.Exec(insertQuery, userID, sessionID, ip, userAgent, expiresAt)
+	if err != nil {
+		log.Printf("❌ LoginPostHandler: failed to create session: %v", err)
+		helpers.WriteError(w, http.StatusInternalServerError, "Gagal membuat session")
+		return
+	}
+
+	log.Printf("✅ LoginPostHandler: session created successfully: %s", sessionID)
 
 	// Set cookie dengan nama yang berbeda dari SSO server
 	// PENTING: Gunakan cookie name yang berbeda untuk mencegah shared cookie
@@ -891,11 +935,32 @@ func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 // DashboardHandler menampilkan halaman dashboard
 // Protected route: menggunakan RequireAuth middleware untuk cek access token
 func DashboardHandler(w http.ResponseWriter, r *http.Request) {
-	// Cek access token dengan middleware
-	RequireAuth(func(w http.ResponseWriter, r *http.Request) {
-		// Token valid, lanjutkan render dashboard
-		renderDashboardWithToken(w, r)
-	})(w, r)
+	log.Printf("🔍 DashboardHandler: accessed by %s", r.RemoteAddr)
+
+	// Cek session langsung tanpa RequireAuth middleware untuk debugging
+	sessionID, err := helpers.GetCookie(r, "client_dinas_session")
+	if err != nil {
+		sessionID, err = helpers.GetCookie(r, "session_id")
+	}
+
+	log.Printf("🔍 DashboardHandler: session ID from cookie: %s", sessionID)
+
+	if sessionID != "" {
+		userID, ok, err := validateSession(sessionID)
+		if ok && err == nil && userID != "" {
+			log.Printf("✅ DashboardHandler: session valid, rendering dashboard for user: %s", userID)
+			renderDashboardWithToken(w, r)
+			return
+		} else {
+			log.Printf("❌ DashboardHandler: session validation failed - ok: %v, err: %v, userID: %s", ok, err, userID)
+		}
+	} else {
+		log.Printf("❌ DashboardHandler: no session cookie found")
+	}
+
+	// Session invalid, redirect to login
+	log.Printf("🔄 DashboardHandler: redirecting to login")
+	http.Redirect(w, r, "/login?next=/dashboard", http.StatusSeeOther)
 }
 
 // renderDashboardWithToken render dashboard setelah token validated
@@ -911,8 +976,9 @@ func renderDashboardWithToken(w http.ResponseWriter, r *http.Request) {
 	var ok bool
 
 	if err == nil && sessionID != "" {
-		// Validasi session jika ada
-		userID, ok, _ = session.ValidateSession(sessionID)
+		// Validasi session jika ada (gunakan fungsi PostgreSQL lokal)
+		userID, ok, _ = validateSession(sessionID)
+		log.Printf("🔍 renderDashboardWithToken: session validation result - userID: %s, ok: %v", userID, ok)
 	}
 
 	// Ambil data user jika session ada
@@ -991,7 +1057,43 @@ func getUserByID(userID string) (map[string]interface{}, error) {
 
 // getUserByIDForDashboard mengambil data user dari Supabase berdasarkan ID
 func getUserByIDForDashboard(userID string) (map[string]interface{}, error) {
-	return getUserByID(userID)
+	// Ambil data user dari PostgreSQL database
+	log.Printf("🔍 getUserByIDForDashboard: getting user data for ID: %s", userID)
+
+	db, err := connectPostgreSQL()
+	if err != nil {
+		log.Printf("❌ getUserByIDForDashboard: failed to connect to PostgreSQL: %v", err)
+		return nil, fmt.Errorf("failed to connect to PostgreSQL: %v", err)
+	}
+	defer db.Close()
+
+	// Query user from PostgreSQL
+	query := `SELECT id_pengguna, email, nama_lengkap, peran, aktif FROM pengguna WHERE id_pengguna = $1`
+
+	var user map[string]interface{}
+	var idPengguna, email, namaLengkap, peran string
+	var aktif bool
+
+	err = db.QueryRow(query, userID).Scan(&idPengguna, &email, &namaLengkap, &peran, &aktif)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Printf("❌ getUserByIDForDashboard: user not found for ID: %s", userID)
+			return nil, fmt.Errorf("user not found")
+		}
+		log.Printf("❌ getUserByIDForDashboard: error querying user: %v", err)
+		return nil, fmt.Errorf("error querying user: %v", err)
+	}
+
+	user = map[string]interface{}{
+		"id_pengguna":  idPengguna,
+		"email":        email,
+		"nama_lengkap": namaLengkap,
+		"peran":        peran,
+		"aktif":        aktif,
+	}
+
+	log.Printf("✅ getUserByIDForDashboard: found user: %s (%s)", namaLengkap, email)
+	return user, nil
 }
 
 // getDashboardCounts mengambil jumlah pengguna, aplikasi, sessions, dan tokens
@@ -1292,22 +1394,22 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
                 <div class="sso-info-item">
                     <div class="sso-info-label">Nama Lengkap</div>
                     <div class="sso-info-value">%s</div>
-                </div>
+            </div>
                 <div class="sso-info-item">
                     <div class="sso-info-label">Email</div>
                     <div class="sso-info-value">%s</div>
-                </div>
+        </div>
                 <div class="sso-info-item">
                     <div class="sso-info-label">Peran</div>
                     <div class="sso-info-value">
                         <span class="sso-info-badge %s">%s</span>
-                    </div>
-                </div>
+            </div>
+            </div>
                 <div class="sso-info-item">
                     <div class="sso-info-label">Status</div>
                     <div class="sso-info-value">
                         <span class="sso-info-badge verified">%s</span>
-                    </div>
+            </div>
                 </div>
             </div>
         </div>
@@ -3283,6 +3385,43 @@ func checkSSOSessionWithCookie(w http.ResponseWriter, r *http.Request) bool {
 
 // createSessionFromEmail gets user from database and creates local session
 // getUserFromPostgreSQL looks up user from local PostgreSQL database
+// createSessionTableIfNotExists creates the sesi_login table if it doesn't exist
+func createSessionTableIfNotExists() error {
+	db, err := connectPostgreSQL()
+	if err != nil {
+		return fmt.Errorf("failed to connect to PostgreSQL: %v", err)
+	}
+	defer db.Close()
+
+	// Drop existing table if it has foreign key constraints
+	dropTableQuery := `DROP TABLE IF EXISTS sesi_login;`
+	_, err = db.Exec(dropTableQuery)
+	if err != nil {
+		log.Printf("WARNING: Failed to drop existing sesi_login table: %v", err)
+	}
+
+	// Create new table without foreign key constraints
+	createTableQuery := `
+		CREATE TABLE sesi_login (
+			id SERIAL PRIMARY KEY,
+			id_pengguna VARCHAR(255) NOT NULL,
+			id_sesi VARCHAR(255) UNIQUE NOT NULL,
+			ip VARCHAR(45),
+			user_agent TEXT,
+			kadaluarsa TIMESTAMP NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);
+	`
+
+	_, err = db.Exec(createTableQuery)
+	if err != nil {
+		return fmt.Errorf("failed to create sesi_login table: %v", err)
+	}
+
+	log.Printf("✅ Session table recreated in PostgreSQL (no foreign keys)")
+	return nil
+}
+
 func getUserFromPostgreSQL(email string) (map[string]interface{}, error) {
 	db, err := connectPostgreSQL()
 	if err != nil {
@@ -3330,81 +3469,6 @@ func getUserFromPostgreSQL(email string) (map[string]interface{}, error) {
 }
 
 // ensureUserInSupabase creates user in Supabase if not exists (for session foreign key)
-func ensureUserInSupabase(user map[string]interface{}, supabaseURL, supabaseKey string) error {
-	// Check if user already exists in Supabase
-	email := user["email"].(string)
-	emailEncoded := url.QueryEscape(email)
-	checkURL := fmt.Sprintf("%s/rest/v1/pengguna?email=eq.%s&select=id_pengguna", supabaseURL, emailEncoded)
-
-	checkReq, err := http.NewRequest("GET", checkURL, nil)
-	if err != nil {
-		return fmt.Errorf("error creating check request: %v", err)
-	}
-
-	checkReq.Header.Set("apikey", supabaseKey)
-	checkReq.Header.Set("Authorization", "Bearer "+supabaseKey)
-	checkReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(checkReq)
-	if err != nil {
-		return fmt.Errorf("error checking user in Supabase: %v", err)
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Supabase check error: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var existingUsers []map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &existingUsers); err != nil {
-		return fmt.Errorf("error parsing check response: %v", err)
-	}
-
-	// If user already exists, no need to create
-	if len(existingUsers) > 0 {
-		log.Printf("✅ User already exists in Supabase")
-		return nil
-	}
-
-	// Create user in Supabase
-	log.Printf("🔄 Creating user in Supabase for session storage...")
-	userData := map[string]interface{}{
-		"id_pengguna":  user["id_pengguna"],
-		"email":        user["email"],
-		"nama_lengkap": user["nama_lengkap"],
-		"peran":        user["peran"],
-		"aktif":        user["aktif"],
-		"password":     "$2a$10$dummy.hash.for.sso.user", // Dummy password hash for SSO users
-	}
-
-	userJSON, _ := json.Marshal(userData)
-	createURL := fmt.Sprintf("%s/rest/v1/pengguna", supabaseURL)
-	createReq, err := http.NewRequest("POST", createURL, bytes.NewBuffer(userJSON))
-	if err != nil {
-		return fmt.Errorf("error creating user request: %v", err)
-	}
-
-	createReq.Header.Set("apikey", supabaseKey)
-	createReq.Header.Set("Authorization", "Bearer "+supabaseKey)
-	createReq.Header.Set("Content-Type", "application/json")
-	createReq.Header.Set("Prefer", "return=representation")
-
-	resp, err = http.DefaultClient.Do(createReq)
-	if err != nil {
-		return fmt.Errorf("error creating user in Supabase: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("Supabase create error: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	log.Printf("✅ User created in Supabase for session storage")
-	return nil
-}
-
 func createSessionFromEmail(r *http.Request, email string) (string, bool) {
 	log.Printf("🔄 Creating session for email: %s", email)
 
@@ -3449,51 +3513,41 @@ func createSessionFromEmail(r *http.Request, email string) (string, bool) {
 		"kadaluarsa":  expiresAt.Format(time.RFC3339), // expires_at → kadaluarsa
 	}
 
-	// Create session in Supabase for session storage
-	supabaseURL := getSupabaseURL()
-	supabaseKey := getSupabaseKey()
-	if supabaseURL == "" || supabaseKey == "" {
-		log.Println("ERROR: Supabase not configured for session storage")
-		return "", false
-	}
-
-	// Ensure user exists in Supabase for session storage
-	log.Printf("🔄 Ensuring user exists in Supabase for session storage...")
-	err = ensureUserInSupabase(user, supabaseURL, supabaseKey)
+	// Ensure session table exists
+	err = createSessionTableIfNotExists()
 	if err != nil {
-		log.Printf("⚠️ Failed to ensure user in Supabase: %v", err)
-		log.Printf("🔄 Creating session without foreign key constraint...")
-		// Use email as id_pengguna to avoid FK constraint issues
-		sessionData["id_pengguna"] = user["email"]
+		log.Printf("ERROR ensuring session table: %v", err)
+		return "", false
 	}
 
-	sessionJSON, _ := json.Marshal(sessionData)
-	apiURL := fmt.Sprintf("%s/rest/v1/sesi_login", supabaseURL)
-	httpReq, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(sessionJSON))
+	// Create session in PostgreSQL database
+	log.Printf("🔄 Creating session in PostgreSQL database...")
+
+	userID := user["id_pengguna"].(string)
+	ip := sessionData["ip"].(string)
+	userAgent := sessionData["user_agent"].(string)
+	// expiresAt already defined above
+
+	// Insert session into PostgreSQL
+	db, err := connectPostgreSQL()
 	if err != nil {
-		log.Printf("ERROR creating session request: %v", err)
+		log.Printf("ERROR connecting to PostgreSQL: %v", err)
 		return "", false
 	}
+	defer db.Close()
 
-	httpReq.Header.Set("apikey", supabaseKey)
-	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Prefer", "return=representation")
+	insertQuery := `
+		INSERT INTO sesi_login (id_pengguna, id_sesi, ip, user_agent, kadaluarsa, created_at) 
+		VALUES ($1, $2, $3, $4, $5, NOW())
+	`
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	_, err = db.Exec(insertQuery, userID, sessionID, ip, userAgent, expiresAt)
 	if err != nil {
-		log.Printf("ERROR creating session: %v", err)
-		return "", false
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		log.Printf("ERROR creating session in Supabase: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
+		log.Printf("ERROR creating session in PostgreSQL: %v", err)
 		return "", false
 	}
 
-	log.Printf("✅ Session created successfully for user from PostgreSQL")
+	log.Printf("✅ Session created successfully in PostgreSQL for user: %s", user["email"])
 
 	// Return session ID for cookie setting
 	return sessionID, true
@@ -4801,13 +4855,73 @@ func getIPAddress(r *http.Request) string {
 // Session Management Functions (moved from internal/session_helper.go for Vercel compatibility)
 
 // createSession membuat session baru di database dan mengembalikan session ID
-func createSession(userID interface{}, r *http.Request) (sessionID string, err error) {
-	supabaseURL := getSupabaseURL()
-	supabaseKey := getSupabaseKey()
-	if supabaseURL == "" || supabaseKey == "" {
-		return "", fmt.Errorf("SUPABASE_URL atau SUPABASE_KEY tidak di-set")
+
+// validateSession memvalidasi session ID dan mengembalikan user ID jika valid
+func validateSession(sessionID string) (userID string, ok bool, err error) {
+	if sessionID == "" {
+		log.Printf("🔍 validateSession: session ID kosong")
+		return "", false, fmt.Errorf("session ID kosong")
 	}
 
+	log.Printf("🔍 validateSession: checking session ID: %s", sessionID)
+
+	// Connect to PostgreSQL
+	db, err := connectPostgreSQL()
+	if err != nil {
+		log.Printf("❌ validateSession: failed to connect to PostgreSQL: %v", err)
+		return "", false, fmt.Errorf("failed to connect to PostgreSQL: %v", err)
+	}
+	defer db.Close()
+
+	// Query session from PostgreSQL
+	var userIDResult string
+	query := `
+		SELECT id_pengguna 
+		FROM sesi_login 
+		WHERE id_sesi = $1 AND kadaluarsa > NOW()
+	`
+
+	log.Printf("🔍 validateSession: executing query with sessionID: %s", sessionID)
+	err = db.QueryRow(query, sessionID).Scan(&userIDResult)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Printf("❌ validateSession: session not found or expired for ID: %s", sessionID)
+			return "", false, nil // Session tidak ditemukan atau sudah expired
+		}
+		log.Printf("❌ validateSession: error querying session: %v", err)
+		return "", false, fmt.Errorf("error querying session: %v", err)
+	}
+
+	log.Printf("✅ validateSession: session valid for user: %s", userIDResult)
+
+	return userIDResult, true, nil
+}
+
+// clearSession menghapus session di database PostgreSQL
+func clearSession(sessionID string) error {
+	if sessionID == "" {
+		return fmt.Errorf("session ID kosong")
+	}
+
+	// Connect to PostgreSQL
+	db, err := connectPostgreSQL()
+	if err != nil {
+		return fmt.Errorf("failed to connect to PostgreSQL: %v", err)
+	}
+	defer db.Close()
+
+	// Delete session from PostgreSQL
+	query := `DELETE FROM sesi_login WHERE id_sesi = $1`
+	_, err = db.Exec(query, sessionID)
+	if err != nil {
+		return fmt.Errorf("error deleting session: %v", err)
+	}
+
+	return nil
+}
+
+// createSession creates a new session in PostgreSQL database
+func createSession(userID interface{}, r *http.Request) (sessionID string, err error) {
 	// Generate session ID
 	sessionID, err = helpers.GenerateSessionID()
 	if err != nil {
@@ -4815,161 +4929,36 @@ func createSession(userID interface{}, r *http.Request) (sessionID string, err e
 		return "", fmt.Errorf("gagal membuat session ID")
 	}
 
-	// Siapkan data session sesuai schema Supabase
+	// Connect to PostgreSQL
+	db, err := connectPostgreSQL()
+	if err != nil {
+		return "", fmt.Errorf("failed to connect to PostgreSQL: %v", err)
+	}
+	defer db.Close()
+
+	// Ensure session table exists
+	err = createSessionTableIfNotExists()
+	if err != nil {
+		return "", fmt.Errorf("failed to ensure session table: %v", err)
+	}
+
+	// Prepare session data
 	expiresAt := time.Now().Add(24 * time.Hour)
-	sessionData := map[string]interface{}{
-		"id_pengguna": userID,
-		"id_sesi":     sessionID,
-		"ip":          getIPAddress(r),
-		"user_agent":  r.UserAgent(),
-		"kadaluarsa":  expiresAt.Format(time.RFC3339),
-	}
 
-	// Convert ke JSON
-	sessionJSON, err := json.Marshal(sessionData)
+	// Insert session into PostgreSQL
+	insertQuery := `
+		INSERT INTO sesi_login (id_pengguna, id_sesi, ip, user_agent, kadaluarsa, created_at) 
+		VALUES ($1, $2, $3, $4, $5, NOW())
+	`
+
+	_, err = db.Exec(insertQuery, userID, sessionID, getIPAddress(r), r.UserAgent(), expiresAt)
 	if err != nil {
-		log.Printf("ERROR marshaling session data: %v", err)
-		return "", fmt.Errorf("gagal memproses data session")
+		log.Printf("ERROR creating session in PostgreSQL: %v", err)
+		return "", fmt.Errorf("gagal membuat session")
 	}
 
-	// POST ke Supabase
-	apiURL := fmt.Sprintf("%s/rest/v1/sesi_login", supabaseURL)
-	httpReq, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(sessionJSON))
-	if err != nil {
-		log.Printf("ERROR creating request: %v", err)
-		return "", fmt.Errorf("gagal membuat request")
-	}
-
-	httpReq.Header.Set("apikey", supabaseKey)
-	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Prefer", "return=representation")
-
-	// Eksekusi request
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		log.Printf("ERROR calling Supabase: %v", err)
-		return "", fmt.Errorf("gagal terhubung ke database")
-	}
-	defer resp.Body.Close()
-
-	// Baca response untuk debugging
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		log.Printf("ERROR Supabase response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
-		return "", fmt.Errorf("gagal membuat session di database: status %d", resp.StatusCode)
-	}
-
-	log.Printf("✅ Session created: %s for user: %v", sessionID, userID)
+	log.Printf("✅ Session created in PostgreSQL: %s", sessionID)
 	return sessionID, nil
-}
-
-// validateSession memvalidasi session ID dan mengembalikan user ID jika valid
-func validateSession(sessionID string) (userID string, ok bool, err error) {
-	supabaseURL := getSupabaseURL()
-	supabaseKey := getSupabaseKey()
-	if supabaseURL == "" || supabaseKey == "" {
-		return "", false, fmt.Errorf("SUPABASE_URL atau SUPABASE_KEY tidak di-set")
-	}
-
-	if sessionID == "" {
-		return "", false, fmt.Errorf("session ID kosong")
-	}
-
-	// Query session dengan proper URL encoding
-	sessionIDEncoded := url.QueryEscape(sessionID)
-	now := time.Now().Format(time.RFC3339)
-	nowEncoded := url.QueryEscape(now)
-
-	// Query: id_sesi = ? AND kadaluarsa > now
-	apiURL := fmt.Sprintf("%s/rest/v1/sesi_login?id_sesi=eq.%s&kadaluarsa=gt.%s&select=id_pengguna",
-		supabaseURL, sessionIDEncoded, nowEncoded)
-
-	httpReq, err := http.NewRequest("GET", apiURL, nil)
-	if err != nil {
-		log.Printf("ERROR creating request: %v", err)
-		return "", false, fmt.Errorf("gagal membuat request")
-	}
-
-	httpReq.Header.Set("apikey", supabaseKey)
-	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		log.Printf("ERROR calling Supabase: %v", err)
-		return "", false, fmt.Errorf("gagal terhubung ke database")
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("ERROR Supabase response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
-		return "", false, fmt.Errorf("gagal memvalidasi session")
-	}
-
-	var sessions []map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &sessions); err != nil {
-		log.Printf("ERROR parsing response: %v", err)
-		return "", false, fmt.Errorf("gagal memproses data")
-	}
-
-	if len(sessions) == 0 {
-		return "", false, nil // Session tidak ditemukan atau expired
-	}
-
-	// Extract id_pengguna (user_id)
-	session := sessions[0]
-	userIDVal := session["id_pengguna"]
-	if userIDVal == nil {
-		return "", false, fmt.Errorf("id_pengguna tidak ditemukan")
-	}
-
-	// Convert id_pengguna ke string
-	userID = fmt.Sprintf("%v", userIDVal)
-	return userID, true, nil
-}
-
-// clearSession menghapus session di database (DELETE)
-func clearSession(sessionID string) error {
-	supabaseURL := getSupabaseURL()
-	supabaseKey := getSupabaseKey()
-	if supabaseURL == "" || supabaseKey == "" {
-		return fmt.Errorf("SUPABASE_URL atau SUPABASE_KEY tidak di-set")
-	}
-
-	if sessionID == "" {
-		return fmt.Errorf("session ID kosong")
-	}
-
-	// DELETE session dari Supabase
-	sessionIDEncoded := url.QueryEscape(sessionID)
-	apiURL := fmt.Sprintf("%s/rest/v1/sesi_login?id_sesi=eq.%s", supabaseURL, sessionIDEncoded)
-	httpReq, err := http.NewRequest("DELETE", apiURL, nil)
-	if err != nil {
-		log.Printf("ERROR creating request: %v", err)
-		return fmt.Errorf("gagal membuat request")
-	}
-
-	httpReq.Header.Set("apikey", supabaseKey)
-	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		log.Printf("ERROR calling Supabase: %v", err)
-		return fmt.Errorf("gagal terhubung ke database")
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		log.Printf("ERROR Supabase response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
-		return fmt.Errorf("gagal menghapus session")
-	}
-
-	log.Printf("✅ Session cleared: %s", sessionID)
-	return nil
 }
 
 // Page rendering functions
@@ -6522,4 +6511,23 @@ func renderProfilePage(w http.ResponseWriter, r *http.Request) {
 </html>`, header, userName, userEmail, userRole)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(html))
+}
+
+func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8070"
+	}
+
+	http.HandleFunc("/", Handler)
+	http.HandleFunc("/login", LoginPageHandler)
+	http.HandleFunc("/dashboard", DashboardHandler)
+	http.HandleFunc("/profile", ProfileHandler)
+	http.HandleFunc("/logout", LogoutHandler)
+	http.HandleFunc("/info-dinas", InfoDinasHandler)
+	http.HandleFunc("/sso/authorize", SSOAuthorizeHandler)
+	http.HandleFunc("/sso/callback", SSOCallbackHandler)
+
+	log.Printf("🚀 Server starting on port %s", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }

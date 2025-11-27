@@ -6,11 +6,10 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"net/http"
 	"os"
+	"os/exec"
 	"strings"
-
-	"client-dinas-pendidikan/api"
+	"time"
 )
 
 func loadEnvFile() {
@@ -41,29 +40,45 @@ func loadEnvFile() {
 	fmt.Println("✅ Loaded environment variables from .env")
 }
 
-func serveLogo(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "image/png")
-	w.Write(api.LogoData)
-}
-
 func main() {
 	// Load environment variables from .env file
 	loadEnvFile()
-
-	// Serve logo
-	http.HandleFunc("/logo.png", serveLogo)
-
-	// All routes go through the main handler
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		api.Handler(w, r)
-	})
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8070"
 	}
 
-	fmt.Printf("🚀 Client Dinas Pendidikan running on http://localhost:%s\n", port)
-	fmt.Println("Press Ctrl+C to stop")
-	http.ListenAndServe(":"+port, nil)
+	// Kill any existing processes on port
+	fmt.Printf("🧹 Cleaning up port %s...\n", port)
+	killCmd := exec.Command("lsof", "-ti:"+port)
+	if output, err := killCmd.Output(); err == nil && len(output) > 0 {
+		pids := strings.TrimSpace(string(output))
+		if pids != "" {
+			for _, pid := range strings.Split(pids, "\n") {
+				if pid != "" {
+					exec.Command("kill", "-9", pid).Run()
+				}
+			}
+			fmt.Printf("✅ Port %s cleaned up\n", port)
+		}
+	}
+
+	// Wait a moment for port to be freed
+	time.Sleep(2 * time.Second)
+
+	fmt.Printf("🚀 Client Dinas Pendidikan starting on http://localhost:%s\n", port)
+	fmt.Println("Building and running server...")
+
+	// Build and run the server
+	cmd := exec.Command("go", "run", "api/main_handler.go")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+
+	err := cmd.Run()
+	if err != nil {
+		fmt.Printf("Error running server: %v\n", err)
+		os.Exit(1)
+	}
 }
