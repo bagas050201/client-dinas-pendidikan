@@ -298,12 +298,14 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Check if authenticated
-		if !isAuthenticated(r) {
-			// Redirect ke login tanpa next param untuk menghindari loop
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
+		if isAuthenticated(r) {
+			// Jika sudah login, redirect ke dashboard
+			http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
 			return
 		}
-		renderHomePage(w, r)
+		
+		// Jika belum login, redirect ke login
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
 	case "/login":
 		// Gunakan handler baru untuk login
 		// Support kedua metode: SSO dan direct login
@@ -524,9 +526,9 @@ func LoginPageHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Cek session jika ada
+		// Cek session jika ada (gunakan validateSession lokal)
 		if sessionID != "" {
-			userID, ok, err := session.ValidateSession(sessionID)
+			userID, ok, err := validateSession(sessionID)
 			if ok && err == nil && userID != "" {
 				// Session valid, redirect ke dashboard
 				next := r.URL.Query().Get("next")
@@ -776,82 +778,6 @@ func LoginPostHandler(w http.ResponseWriter, r *http.Request) {
 	// Jangan tulis response body sebelum redirect
 	http.Redirect(w, r, next, http.StatusSeeOther)
 }
-
-// RequireAuth adalah middleware untuk protect routes
-// Cek apakah user memiliki access token ATAU session yang valid
-// Support kedua metode: SSO (access token) dan direct login (session)
-// func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
-// 	return func(w http.ResponseWriter, r *http.Request) {
-// 		// Cek 1: Access token dari SSO (prioritas pertama)
-// 		accessToken, err := helpers.GetCookie(r, "sso_access_token")
-// 		if err == nil && accessToken != "" {
-// 			// Cek token expiration
-// 			tokenExpiresStr, err := helpers.GetCookie(r, "sso_token_expires")
-// 			if err == nil && tokenExpiresStr != "" {
-// 				tokenExpires, err := strconv.ParseInt(tokenExpiresStr, 10, 64)
-// 				if err == nil && time.Now().Unix() <= tokenExpires {
-// 					// Access token valid, lanjutkan
-// 					log.Printf("✅ Access token valid")
-// 					next(w, r)
-// 					return
-// 				}
-// 			}
-// 			// Token expired atau invalid, clear cookies
-// 			log.Printf("WARNING: Access token expired or invalid, clearing cookies")
-// 			helpers.ClearCookie(w, r, "sso_access_token")
-// 			helpers.ClearCookie(w, r, "sso_token_expires")
-// 		}
-
-// 		// Cek 2: Session dari direct login (fallback)
-// 		// PENTING: Hanya gunakan cookie client_dinas_session, JANGAN gunakan sso_admin_session dari SSO server
-// 		sessionID, err := helpers.GetCookie(r, "client_dinas_session")
-// 		if err != nil {
-// 			// Fallback ke session_id untuk backward compatibility (cookie lama dari direct login)
-// 			sessionID, err = helpers.GetCookie(r, "session_id")
-// 		}
-// 		if err == nil && sessionID != "" {
-// 			userID, ok, err := session.ValidateSession(sessionID)
-// 			if ok && err == nil && userID != "" {
-// 				// Session valid, lanjutkan
-// 				log.Printf("✅ Session valid for user: %s", userID)
-// 				next(w, r)
-// 				return
-// 			}
-// 			// Session invalid, clear cookie
-// 			if !ok {
-// 				log.Printf("WARNING: Session invalid, clearing cookie")
-// 				helpers.ClearCookie(w, r, "client_dinas_session")
-// 				helpers.ClearCookie(w, r, "session_id") // Clear juga untuk backward compatibility
-// 			}
-// 		}
-
-// 		// Tidak ada token atau session yang valid, redirect ke login
-// 		// JANGAN tambahkan error=no_token untuk menghindari redirect loop
-// 		currentPath := r.URL.Path
-
-// 		// Skip redirect untuk static files, API, dan favicon
-// 		if strings.HasPrefix(currentPath, "/static/") ||
-// 			strings.HasPrefix(currentPath, "/api/") ||
-// 			currentPath == "/favicon.ico" ||
-// 			currentPath == "/logo.png" ||
-// 			currentPath == "/login" ||
-// 			currentPath == "/register" {
-// 			// Route ini tidak perlu auth, langsung return 404 atau biarkan handler lain handle
-// 			http.NotFound(w, r)
-// 			return
-// 		}
-
-// 		// Redirect ke login dengan next param
-// 		// Hanya tambahkan next jika path bukan / (root)
-// 		redirectURL := "/login"
-// 		if currentPath != "/" {
-// 			redirectURL = "/login?next=" + helpers.SanitizeInput(currentPath)
-// 		}
-
-// 		log.Printf("WARNING: No valid auth found for path %s, redirecting to: %s", currentPath, redirectURL)
-// 		http.Redirect(w, r, redirectURL, http.StatusSeeOther)
-// 	}
-// }
 
 // RequireAuth middleware — perbaikan
 func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -3847,54 +3773,13 @@ func isAuthenticated(r *http.Request) bool {
 		}
 	}
 
-	// Validate Supabase connection
-	supabaseURL := getSupabaseURL()
-	supabaseKey := getSupabaseKey()
-	if supabaseURL == "" || supabaseKey == "" {
+	// Validate session using local PostgreSQL connection (same as DashboardHandler)
+	userID, ok, err := validateSession(sessionID)
+	if !ok || err != nil || userID == "" {
+		log.Printf("WARNING: Session invalid in isAuthenticated: %v, error: %v", ok, err)
 		return false
 	}
 
-	// Check session in Supabase with proper URL encoding
-	// Schema: id_sesi (text), kadaluarsa (timestamptz), id_pengguna (uuid)
-	// PENTING: Kita perlu memastikan session ini dibuat oleh client website, bukan SSO server
-	// Untuk sementara, kita akan cek user_agent untuk membedakan
-	// (Ini bukan solusi sempurna, tapi cukup untuk development)
-	sessionIDEncoded := url.QueryEscape(sessionID)
-	expiresEncoded := url.QueryEscape(time.Now().Format(time.RFC3339))
-
-	// Query session dengan filter user_agent untuk memastikan session dari client website
-	// SSO server biasanya punya user_agent yang berbeda, atau kita bisa tambahkan kolom client_id
-	// Untuk sementara, kita hanya cek apakah session valid dan belum expired
-	apiURL := fmt.Sprintf("%s/rest/v1/sesi_login?id_sesi=eq.%s&kadaluarsa=gt.%s&select=*,pengguna(*)",
-		supabaseURL, sessionIDEncoded, expiresEncoded)
-
-	req, err := http.NewRequest("GET", apiURL, nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("apikey", supabaseKey)
-	req.Header.Set("Authorization", "Bearer "+supabaseKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		return false
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	var sessions []map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &sessions); err != nil {
-		return false
-	}
-
-	if len(sessions) == 0 {
-		return false
-	}
-
-	// PENTING: Session ini hanya dibuat oleh client website sendiri setelah OAuth 2.0 flow
-	// Tidak perlu cek prefix karena session sudah terpisah (hanya dibuat oleh client website)
-	// Jika session ada di database, berarti valid (karena hanya dibuat oleh client website)
 	return true
 }
 
