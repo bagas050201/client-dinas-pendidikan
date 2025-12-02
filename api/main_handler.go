@@ -191,121 +191,53 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	// Static pages - menggunakan handler baru yang modular
 	switch path {
 	case "/", "/home":
-		// Check SSO callback dari Keycloak (Authorization Code Flow)
-		// Format: /?code=<authorization_code>&state=<state_token>
-		// Keycloak akan redirect user ke website ini dengan authorization code
+		// ============================================
+		// FLOW BARU: Standard OIDC dengan Keycloak
+		// ============================================
+		// 1. Portal SSO redirect tanpa token (hanya plain URL)
+		// 2. Check session lokal
+		// 3. Jika tidak ada, redirect ke Keycloak dengan prompt=none (auto-login)
+		// 4. Keycloak return authorization code jika ada session
+		// 5. Exchange code untuk token
+		
+		// Check apakah ada authorization code dari Keycloak callback
 		code := r.URL.Query().Get("code")
-		state := r.URL.Query().Get("state")
 		errorParam := r.URL.Query().Get("error")
-
-		// Juga support format baru: sso_token (access_token) dan sso_id_token (ID token dengan user info)
-		ssoToken := r.URL.Query().Get("sso_token")
-		ssoIdToken := r.URL.Query().Get("sso_id_token")
-
-		// PENTING: Handle sso_token dan sso_id_token di root path (dari website SSO)
-		// Flow baru: sso_id_token berisi user info lengkap (TANPA perlu call API)
-		// Prioritas: sso_id_token > sso_token (karena id_token sudah berisi user info)
-		if ssoIdToken != "" || ssoToken != "" {
-			log.Printf("🔐 SSO token detected in root path, processing...")
-			if ssoIdToken != "" {
-				log.Printf("   ID token present (length: %d) - berisi user info lengkap", len(ssoIdToken))
-			}
-			if ssoToken != "" {
-				log.Printf("   Access token present (length: %d)", len(ssoToken))
-			}
-
-			// PRIORITAS: Process sso_id_token dulu (karena sudah berisi user info)
-			var success bool
-			if ssoIdToken != "" {
-				log.Printf("🔄 Processing sso_id_token (prioritas - berisi user info)...")
-				success = handleSSOTokenWithCookie(w, r, ssoIdToken)
-			}
-
-			// Jika sso_id_token gagal, coba sso_token sebagai fallback
-			if !success && ssoToken != "" {
-				log.Printf("⚠️ sso_id_token failed, trying sso_token as fallback...")
-				success = handleSSOTokenWithCookie(w, r, ssoToken)
-			}
-
-			if success {
-				// Session berhasil dibuat, render halaman sukses dengan JavaScript redirect
-				next := r.URL.Query().Get("next")
-				if next == "" {
-					next = "/dashboard"
-				}
-				log.Printf("✅ SSO token processed successfully, rendering success page with redirect to: %s", next)
-
-				// Render halaman sukses dengan JavaScript redirect (untuk memastikan cookie ter-set)
-				w.Header().Set("Content-Type", "text/html; charset=utf-8")
-				successHTML := fmt.Sprintf(`
-<!DOCTYPE html>
-<html>
-<head>
-    <title>SSO Login Berhasil</title>
-    <meta charset="utf-8">
-</head>
-<body>
-    <div style="text-align: center; padding: 50px; font-family: Arial, sans-serif;">
-        <h2>✅ Login SSO Berhasil!</h2>
-        <p>Redirecting to dashboard...</p>
-        <script>
-            console.log('🔄 SSO login success, redirecting to dashboard...');
-            setTimeout(function() {
-                window.location.href = '%s';
-            }, 1000);
-        </script>
-    </div>
-</body>
-</html>`, next)
-				w.Write([]byte(successHTML))
-				return
-			} else {
-				log.Printf("❌ Failed to process SSO token (both sso_id_token and sso_token failed)")
-				// Redirect dengan error message
-				http.Redirect(w, r, "/login?error=sso_token_failed&message="+url.QueryEscape("Gagal memproses SSO token. Silakan coba lagi."), http.StatusSeeOther)
-				return
-			}
-		}
-
-		// Jika ada authorization code, state, atau error dari Keycloak, redirect ke login dengan semua query parameters
-		if code != "" || state != "" || errorParam != "" {
-			// Pastikan semua query parameters dibawa saat redirect ke login
-			// Login page sudah include sso-handler.js yang akan auto-process code/token dan login user
-			queryString := r.URL.RawQuery
-			if queryString != "" {
-				redirectURL := "/login?" + queryString
-				log.Printf("🔐 SSO callback detected (code=%s, state=%s), redirecting to: %s",
-					func() string {
-						if len(code) > 10 {
-							return code[:10] + "..."
-						}
-						return code
-					}(),
-					func() string {
-						if len(state) > 10 {
-							return state[:10] + "..."
-						}
-						return state
-					}(),
-					redirectURL)
-				http.Redirect(w, r, redirectURL, http.StatusSeeOther)
-			} else {
-				// Fallback jika RawQuery kosong (tidak seharusnya terjadi)
-				log.Printf("⚠️ WARNING: SSO callback detected but RawQuery is empty")
-				http.Redirect(w, r, "/login", http.StatusSeeOther)
-			}
+		
+		if code != "" {
+			// Ada code dari Keycloak, redirect ke callback handler
+			log.Printf("🔐 Authorization code received, redirecting to /callback")
+			http.Redirect(w, r, "/callback?"+r.URL.RawQuery, http.StatusSeeOther)
 			return
 		}
-
-		// Check if authenticated
+		
+		if errorParam != "" {
+			// Ada error dari Keycloak (prompt=none gagal)
+			if errorParam == "login_required" || errorParam == "interaction_required" {
+				// User belum login di Keycloak, redirect ke login (tanpa prompt=none)
+				log.Printf("🔄 Auto-login failed (%s), redirecting to Keycloak login form", errorParam)
+				redirectToKeycloakLogin(w, r, false) // false = tanpa prompt=none
+				return
+			}
+			// Error lain, tampilkan pesan
+			errorDesc := r.URL.Query().Get("error_description")
+			log.Printf("❌ OAuth error: %s - %s", errorParam, errorDesc)
+			http.Error(w, "SSO Error: "+errorParam, http.StatusBadRequest)
+			return
+		}
+		
+		// Check session lokal
 		if isAuthenticated(r) {
-			// Jika sudah login, redirect ke dashboard
+			// Sudah login, redirect ke dashboard
+			log.Printf("✅ User already authenticated, redirecting to dashboard")
 			http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
 			return
 		}
 		
-		// Jika belum login, redirect ke login
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		// Belum login, check Keycloak session dengan prompt=none
+		log.Printf("🔄 No local session found, checking Keycloak session with prompt=none")
+		redirectToKeycloakLogin(w, r, true) // true = dengan prompt=none
+
 	case "/login":
 		// Gunakan handler baru untuk login
 		// Support kedua metode: SSO dan direct login
@@ -360,12 +292,12 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		SSOAuthorizeHandler(w, r)
 		return
 	case "/oauth/callback":
-		// Handler untuk callback dari SSO setelah login (endpoint baru)
-		SSOCallbackHandler(w, r)
+		// Handler untuk callback dari OAuth/OIDC (endpoint baru)
+		handleOAuthCallback(w, r)
 		return
 	case "/callback":
-		// Handler untuk callback dari SSO setelah login (kompatibilitas)
-		SSOCallbackHandler(w, r)
+		// Handler untuk callback dari OAuth/OIDC (kompatibilitas)
+		handleOAuthCallback(w, r)
 		return
 	default:
 		http.NotFound(w, r)
@@ -2963,41 +2895,88 @@ func renderProfilePageNew(w http.ResponseWriter, user map[string]interface{}) {
 // 1. Ambil session ID dari cookie client_dinas_session
 // 2. Revoke session di database (DELETE dari database)
 // 3. Clear SEMUA cookie terkait auth client website
-// 4. Redirect ke halaman home (/)
-// PENTING: Logout di client website TIDAK logout dari SSO server (OAuth 2.0 standard)
+// 4. Redirect ke Keycloak logout endpoint (Centralized Logout)
 func LogoutHandler(w http.ResponseWriter, r *http.Request) {
 	// Ambil session ID dari cookie client website
-	// PENTING: Gunakan cookie name yang berbeda dari SSO server
-	sessionID, err := helpers.GetCookie(r, "client_dinas_session")
-	if err == nil && sessionID != "" {
+	sessionID, _ := helpers.GetCookie(r, "client_dinas_session")
+	if sessionID != "" {
 		// Revoke session di database (DELETE)
 		if err := session.ClearSession(sessionID); err != nil {
 			log.Printf("WARNING: Error clearing session: %v", err)
-			// Lanjutkan meskipun error, tetap clear cookie
 		} else {
 			log.Printf("✅ Session revoked from database: %s", sessionID)
 		}
 	}
 
+	// Ambil ID Token untuk hint logout ke Keycloak (sebelum dihapus)
+	idToken, _ := helpers.GetCookie(r, "sso_id_token")
+
 	// Clear SEMUA cookie terkait auth client website
-	// PENTING: Hanya hapus cookie client website, TIDAK hapus cookie SSO server
 	helpers.ClearCookie(w, r, "client_dinas_session") // Session dari client website
 	helpers.ClearCookie(w, r, "sso_access_token")     // Access token dari SSO (OAuth 2.0)
+	helpers.ClearCookie(w, r, "sso_id_token")         // ID token
 	helpers.ClearCookie(w, r, "sso_token_expires")    // Token expiration
 	helpers.ClearCookie(w, r, "sso_state")            // State untuk CSRF protection
-	helpers.ClearCookie(w, r, "sso_code_verifier")    // PKCE verifier (jika ada)
+	helpers.ClearCookie(w, r, "oauth_state")          // OAuth State
+	helpers.ClearCookie(w, r, "oauth_code_verifier")  // PKCE Verifier
+	helpers.ClearCookie(w, r, "session_id")           // Legacy cookie
 
-	// Clear cookie lama untuk backward compatibility
-	helpers.ClearCookie(w, r, "session_id")
-	// PENTING: Jangan clear sso_admin_session karena itu cookie dari SSO server
-	// Logout di client website tidak seharusnya logout dari SSO server (OAuth 2.0 standard)
+	log.Printf("✅ All auth cookies cleared, user logged out locally")
 
-	log.Printf("✅ All auth cookies cleared, user logged out")
+	// Centralized Logout: Redirect ke Keycloak
+	keycloakBaseURL := getKeycloakBaseURL()
+	realm := getKeycloakRealm()
+	clientID := getKeycloakClientID()
+	// Redirect back to client login page after logout
+	postLogoutRedirectURI := "http://localhost:8070/login" 
 
-	// Render halaman logout yang akan clear localStorage sebelum redirect
-	// PENTING: Hapus app_session_token dari localStorage untuk mencegah redirect loop
-	renderLogoutPage(w)
+	logoutURL := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/logout?client_id=%s&post_logout_redirect_uri=%s",
+		keycloakBaseURL, realm, clientID, url.QueryEscape(postLogoutRedirectURI))
+
+	// Jika ada ID Token, tambahkan sebagai hint (dianjurkan oleh OIDC)
+	if idToken != "" {
+		logoutURL += fmt.Sprintf("&id_token_hint=%s", idToken)
+	}
+
+	log.Printf("👋 Redirecting to Keycloak logout: %s", logoutURL)
+	http.Redirect(w, r, logoutURL, http.StatusSeeOther)
 }
+
+// FrontChannelLogoutHandler menangani request logout DARI Keycloak (bukan dari user)
+// Handler ini HANYA menghapus session lokal dan TIDAK redirect balik ke Keycloak
+// Ini mencegah infinite loop error.
+func FrontChannelLogoutHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("🔔 Front-Channel Logout triggered by Keycloak")
+
+	// Ambil session ID (opsional, untuk logging)
+	sessionID, _ := helpers.GetCookie(r, "client_dinas_session")
+	if sessionID != "" {
+		session.ClearSession(sessionID)
+		log.Printf("✅ Session revoked: %s", sessionID)
+	}
+
+	// Clear SEMUA cookie
+	helpers.ClearCookie(w, r, "client_dinas_session")
+	helpers.ClearCookie(w, r, "sso_access_token")
+	helpers.ClearCookie(w, r, "sso_id_token")
+	helpers.ClearCookie(w, r, "sso_token_expires")
+	helpers.ClearCookie(w, r, "sso_state")
+	helpers.ClearCookie(w, r, "oauth_state")
+	helpers.ClearCookie(w, r, "oauth_code_verifier")
+	helpers.ClearCookie(w, r, "session_id")
+
+	// Return 200 OK agar Keycloak tahu logout berhasil
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte("<html><body>Logged out from Client</body></html>"))
+}
+
+
+// SSOLoginHandler initiates the SSO flow (triggered by "Login with SSO" button)
+func SSOLoginHandler(w http.ResponseWriter, r *http.Request) {
+	// Redirect to Keycloak WITHOUT prompt=none (show login form if needed)
+	redirectToKeycloakLogin(w, r, false)
+}
+
 
 // renderLogoutPage menampilkan halaman logout yang akan clear localStorage dan sessionStorage
 // sebelum redirect ke halaman login
@@ -4957,6 +4936,34 @@ func renderLoginPage(w http.ResponseWriter, errorMsg, email string) {
         .btn-primary:hover {
             background: #4f46e5;
         }
+        .btn-sso {
+            width: 100%%;
+            padding: 14px;
+            background: linear-gradient(135deg, #4f46e5 0%%, #4338ca 100%%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-top: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-decoration: none;
+            box-shadow: 0 4px 6px -1px rgba(79, 70, 229, 0.2), 0 2px 4px -1px rgba(79, 70, 229, 0.1);
+        }
+        .btn-sso:hover {
+            background: linear-gradient(135deg, #4338ca 0%%, #3730a3 100%%);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(79, 70, 229, 0.3);
+        }
+        .btn-sso svg {
+            width: 20px;
+            height: 20px;
+            margin-right: 10px;
+        }
         .btn-primary:disabled {
             background: #94a3b8;
             cursor: not-allowed;
@@ -5027,6 +5034,18 @@ func renderLoginPage(w http.ResponseWriter, errorMsg, email string) {
             </div>
             <button type="submit" class="btn-primary" id="submitBtn">Masuk</button>
         </form>
+        
+        <div style="text-align: center; margin: 20px 0; position: relative;">
+            <hr style="border: 0; border-top: 1px solid #e2e8f0;">
+            <span style="position: absolute; top: -10px; left: 50%; transform: translateX(-50%); background: white; padding: 0 10px; color: #64748b; font-size: 14px;">atau</span>
+        </div>
+
+        <a href="/sso/login" class="btn-sso">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
+            </svg>
+            Login dengan SSO
+        </a>
         <div class="link-text">
             Belum punya akun? <a href="/register">Daftar di sini</a>
         </div>
@@ -6412,6 +6431,8 @@ func main() {
 	http.HandleFunc("/info-dinas", InfoDinasHandler)
 	http.HandleFunc("/sso/authorize", SSOAuthorizeHandler)
 	http.HandleFunc("/sso/callback", SSOCallbackHandler)
+	http.HandleFunc("/sso/login", SSOLoginHandler) // New SSO Login Route
+	http.HandleFunc("/sso/logout-listener", FrontChannelLogoutHandler) // Special handler for Keycloak
 
 	log.Printf("🚀 Server starting on port %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))

@@ -171,3 +171,57 @@ func SanitizeInput(input string) string {
 	}
 	return result
 }
+
+// Base64URLDecode decodes a base64url encoded string (used for JWT tokens)
+func Base64URLDecode(input string) ([]byte, error) {
+	// JWT uses base64url encoding (RFC 4648), not standard base64
+	// Convert base64url to standard base64 by replacing - with + and _ with /
+	var result = input
+	result = replaceChar(result, '-', '+')
+	result = replaceChar(result, '_', '/')
+	
+	// Add padding if necessary
+	switch len(result) % 4 {
+	case 2:
+		result += "=="
+	case 3:
+		result += "="
+	}
+	
+	return base64.StdEncoding.DecodeString(result)
+}
+
+// replaceChar replaces all occurrences of old with new in the string
+func replaceChar(s string, old, new byte) string {
+	result := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == old {
+			result[i] = new
+		} else {
+			result[i] = s[i]
+		}
+	}
+	return string(result)
+}
+
+// GenerateRandomString generates a random string of specified length
+// Used for state generation in OAuth flow
+func GenerateRandomString(length int) (string, error) {
+	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+	b := make([]byte, length)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	
+	result := make([]byte, length)
+	for i := 0; i < length; i++ {
+		result[i] = charset[int(b[i])%len(charset)]
+	}
+	
+	return string(result), nil
+}
+
+// DeleteCookie is an alias for ClearCookie for consistency with SetCookie/GetCookie
+func DeleteCookie(w http.ResponseWriter, name string) {
+	ClearCookie(w, nil, name)
+}

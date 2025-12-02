@@ -70,8 +70,8 @@ func main() {
 	fmt.Printf("🚀 Client Dinas Pendidikan starting on http://localhost:%s\n", port)
 	fmt.Println("Building and running server...")
 
-	// Build and run the server
-	cmd := exec.Command("go", "run", "api/main_handler.go")
+	// Build and run the server (include ALL .go files in api directory)
+	cmd := exec.Command("go", "run", "./api")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
