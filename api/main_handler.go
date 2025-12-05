@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"client-dinas-pendidikan/api/session"
 	"client-dinas-pendidikan/pkg/helpers"
 	"crypto/rand"
 	"crypto/rsa"
@@ -33,24 +32,18 @@ var LogoData []byte
 //go:embed static/sso-handler.js
 var SSOHandlerJS []byte
 
-// getSupabaseURL returns SUPABASE_URL from environment
+// Dummy functions untuk backward compatibility dengan kode lama
+// (fungsi-fungsi ini sudah tidak digunakan di flow SSO baru yang pakai Keycloak)
 func getSupabaseURL() string {
-	return os.Getenv("SUPABASE_URL")
+	return "" // Not used anymore
 }
 
-// getSupabaseKey returns SUPABASE_KEY from environment
 func getSupabaseKey() string {
-	return os.Getenv("SUPABASE_KEY")
+	return "" // Not used anymore
 }
 
-// getJWTPrivateKey returns JWT_PRIVATE_KEY from environment
-func getJWTPrivateKey() string {
-	return os.Getenv("JWT_PRIVATE_KEY")
-}
-
-// getJWTPublicKey returns JWT_PUBLIC_KEY from environment
 func getJWTPublicKey() string {
-	return os.Getenv("JWT_PUBLIC_KEY")
+	return "" // Not used anymore - sekarang pakai Keycloak
 }
 
 // PostgreSQL connection functions
@@ -742,7 +735,7 @@ func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 			sessionID, err = helpers.GetCookie(r, "session_id") // backward compat
 		}
 		if err == nil && sessionID != "" {
-			userID, ok, err := session.ValidateSession(sessionID)
+			userID, ok, err := validateSession(sessionID)
 			if ok && err == nil && userID != "" {
 				log.Printf("✅ Session valid for user: %s", userID)
 				next(w, r)
@@ -1434,7 +1427,7 @@ func InfoDinasHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validasi session
-	_, ok, err := session.ValidateSession(sessionID)
+	_, ok, err := validateSession(sessionID)
 	if !ok || err != nil {
 		log.Printf("WARNING: Invalid session: %v, error: %v", ok, err)
 		helpers.ClearCookie(w, r, "client_dinas_session")
@@ -2512,7 +2505,7 @@ func SSOCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("✅ User found/created: %v", userID)
 
 	// Buat session di database client (WAJIB)
-	sessionID, err := session.CreateSession(userID, r)
+	sessionID, err := createSession(userID, r)
 	if err != nil {
 		log.Printf("❌ ERROR creating session: %v", err)
 		http.Redirect(w, r, "/login?error=session_creation_failed&message="+url.QueryEscape("Gagal membuat session"), http.StatusSeeOther)
@@ -2564,7 +2557,7 @@ func ProfileHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validasi session
-	userID, ok, err := session.ValidateSession(sessionID)
+	userID, ok, err := validateSession(sessionID)
 	if !ok || err != nil {
 		log.Printf("WARNING: Invalid session: %v, error: %v", ok, err)
 		helpers.ClearCookie(w, r, "client_dinas_session")
@@ -2900,11 +2893,16 @@ func LogoutHandler(w http.ResponseWriter, r *http.Request) {
 	// Ambil session ID dari cookie client website
 	sessionID, _ := helpers.GetCookie(r, "client_dinas_session")
 	if sessionID != "" {
-		// Revoke session di database (DELETE)
-		if err := session.ClearSession(sessionID); err != nil {
-			log.Printf("WARNING: Error clearing session: %v", err)
-		} else {
-			log.Printf("✅ Session revoked from database: %s", sessionID)
+		// Revoke session di database (DELETE dari PostgreSQL)
+		db, err := connectPostgreSQL()
+		if err == nil {
+			_, err = db.Exec("DELETE FROM sesi_login WHERE id_sesi = $1", sessionID)
+			if err != nil {
+				log.Printf("WARNING: Error clearing session: %v", err)
+			} else {
+				log.Printf("✅ Session revoked from database: %s", sessionID)
+			}
+			db.Close()
 		}
 	}
 
@@ -2951,7 +2949,12 @@ func FrontChannelLogoutHandler(w http.ResponseWriter, r *http.Request) {
 	// Ambil session ID (opsional, untuk logging)
 	sessionID, _ := helpers.GetCookie(r, "client_dinas_session")
 	if sessionID != "" {
-		session.ClearSession(sessionID)
+		// Revoke session dari PostgreSQL
+		db, err := connectPostgreSQL()
+		if err == nil {
+			db.Exec("DELETE FROM sesi_login WHERE id_sesi = $1", sessionID)
+			db.Close()
+		}
 		log.Printf("✅ Session revoked: %s", sessionID)
 	}
 
@@ -4118,8 +4121,8 @@ func handleRegisterAPI(w http.ResponseWriter, r *http.Request) {
 	// Convert userID ke string untuk konsistensi
 	userID := fmt.Sprintf("%v", userIDVal)
 
-	// Buat session menggunakan session.CreateSession
-	sessionID, err := session.CreateSession(userID, r)
+	// Buat session menggunakan createSession (fungsi lokal)
+	sessionID, err := createSession(userID, r)
 	if err != nil {
 		log.Printf("WARNING: Error creating session: %v", err)
 		// Lanjutkan meskipun error, registrasi tetap berhasil
@@ -4679,7 +4682,7 @@ func handleSSOAuthLoginAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create session
-	sessionID, err := session.CreateSession(userID, r)
+	sessionID, err := createSession(userID, r)
 	if err != nil {
 		log.Printf("ERROR creating session: %v", err)
 		helpers.WriteError(w, http.StatusInternalServerError, "Failed to create session")
