@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 // ============================================
@@ -104,11 +105,26 @@ func redirectToKeycloakLogin(w http.ResponseWriter, r *http.Request, withPromptN
 		params.Add("prompt", "none") // ⚡ KUNCI AUTO-LOGIN
 	}
 
-	authURL := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/auth?%s",
+	authURL := fmt.Sprintf("%s/sso-auth/realms/%s/protocol/openid-connect/auth?%s",
 		keycloakBaseURL, realm, params.Encode())
 
 	log.Printf("🔐 Redirecting to Keycloak (prompt=none: %v, PKCE: yes): %s", withPromptNone, authURL)
 	http.Redirect(w, r, authURL, http.StatusSeeOther)
+}
+
+// redirectToKeycloakLogout redirects user ke Keycloak untuk logout
+func redirectToKeycloakLogout(w http.ResponseWriter, r *http.Request, idToken string, postLogoutRedirectURI string) {
+	keycloakBaseURL := getKeycloakBaseURL()
+	realm := getKeycloakRealm()
+	clientID := getKeycloakClientID()
+
+	// Build logout URL
+	// Format: /realms/{realm-name}/protocol/openid-connect/logout
+	logoutURL := fmt.Sprintf("%s/sso-auth/realms/%s/protocol/openid-connect/logout?client_id=%s&post_logout_redirect_uri=%s&id_token_hint=%s",
+		keycloakBaseURL, realm, clientID, url.QueryEscape(postLogoutRedirectURI), idToken)
+
+	log.Printf("👋 Redirecting to Keycloak Logout: %s", logoutURL)
+	http.Redirect(w, r, logoutURL, http.StatusSeeOther)
 }
 
 // ============================================
@@ -140,7 +156,7 @@ func exchangeKeycloakCode(w http.ResponseWriter, r *http.Request, code string) (
 	// Delete verifier cookie (single use)
 	helpers.DeleteCookie(w, "oauth_code_verifier")
 
-	tokenURL := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/token",
+	tokenURL := fmt.Sprintf("%s/sso-auth/realms/%s/protocol/openid-connect/token",
 		keycloakBaseURL, realm)
 
 	log.Printf("🔄 Exchanging authorization code for token...")
@@ -227,7 +243,21 @@ func getUserInfoFromIDToken(idToken string) (map[string]interface{}, error) {
 		"email_verified":     claims["email_verified"],
 	}
 
-	log.Printf("✅ User info extracted from ID token: email=%v", claims["email"])
+	// Fallback: Extract identifier from 'sub' if email/preferred_username is missing
+	// Format sub: f:cf34bae9-2c14-4a1e-bb37-06e8ec56a40a:111111
+	if userInfo["email"] == nil && userInfo["preferred_username"] == nil {
+		if sub, ok := claims["sub"].(string); ok {
+			parts := strings.Split(sub, ":")
+			if len(parts) >= 3 {
+				identifier := parts[len(parts)-1] // Ambil bagian terakhir (111111)
+				userInfo["preferred_username"] = identifier
+				log.Printf("⚠️ Using identifier from 'sub' claim: %s", identifier)
+			}
+		}
+	}
+
+	log.Printf("🔍 DEBUG: Full Claims from ID Token: %+v", claims)
+	log.Printf("✅ User info extracted from ID token: email=%v, preferred_username=%v", userInfo["email"], userInfo["preferred_username"])
 	return userInfo, nil
 }
 
@@ -249,19 +279,27 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		errorDesc := r.URL.Query().Get("error_description")
 		log.Printf("❌ OAuth error: %s - %s", errorParam, errorDesc)
 
+		// Handle Silent SSO failure (login_required)
 		if errorParam == "login_required" || errorParam == "interaction_required" {
-			// Redirect ke Keycloak dengan form login (tanpa prompt=none)
-			log.Printf("🔄 Auto-login failed, redirecting to login form")
-			redirectToKeycloakLogin(w, r, false)
+			log.Printf("ℹ️ Silent SSO check failed (user not logged in), redirecting to login page...")
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
 
-		http.Error(w, "OAuth Error: "+errorParam, http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("OAuth error: %s", errorDesc), http.StatusBadRequest)
 		return
 	}
 
 	// 2. Verify state (CSRF protection)
 	storedState, err := helpers.GetCookie(r, "oauth_state")
+	
+	// DEBUG: Log all cookies
+	log.Printf("🍪 DEBUG: Cookies received in callback:")
+	for _, c := range r.Cookies() {
+		log.Printf("   - %s: %s", c.Name, c.Value)
+	}
+	log.Printf("🔍 DEBUG: State check - Received: %s, Stored: %s", state, storedState)
+
 	if err != nil || state != storedState {
 		log.Printf("❌ State mismatch or missing: stored=%s, received=%s", storedState, state)
 		http.Error(w, "Invalid state", http.StatusBadRequest)
@@ -298,21 +336,28 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract email
-	email, ok := userInfo["email"].(string)
-	if !ok || email == "" {
-		log.Printf("❌ Email not found in user info")
-		http.Error(w, "Email not found", http.StatusBadRequest)
+	// Extract identifier (email or preferred_username)
+	identifier, ok := userInfo["email"].(string)
+	if !ok || identifier == "" {
+		// Fallback to preferred_username
+		if u, ok := userInfo["preferred_username"].(string); ok {
+			identifier = u
+		}
+	}
+
+	if identifier == "" {
+		log.Printf("❌ Identifier (email/username) not found in user info")
+		http.Error(w, "Email/Username not found", http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("✅ User info from Keycloak: email=%s, name=%v", email, userInfo["name"])
-	log.Printf("🔍 Attempting to find user in local DB with email: %s", email)
+	log.Printf("✅ User info from Keycloak: identifier=%s, name=%v", identifier, userInfo["name"])
+	log.Printf("🔍 Attempting to find user in local DB with identifier: %s", identifier)
 
 	// 6. Create session lokal
-	sessionID, success := createSessionFromEmail(r, email)
+	sessionID, success := createSessionFromIdentifier(r, identifier)
 	if !success || sessionID == "" {
-		log.Printf("❌ Failed to create session for email: %s", email)
+		log.Printf("❌ Failed to create session for identifier: %s", identifier)
 		http.Error(w, "Failed to create session", http.StatusInternalServerError)
 		return
 	}
@@ -321,6 +366,8 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	helpers.SetCookie(w, r, "client_dinas_session", sessionID, 86400)     // 24 hours
 	helpers.SetCookie(w, r, "sso_access_token", tokenData.AccessToken, 86400)
 	helpers.SetCookie(w, r, "sso_id_token", tokenData.IDToken, 86400)
+	// Set waktu check terakhir untuk mencegah redirect loop
+	helpers.SetCookie(w, r, "sso_check_time", fmt.Sprintf("%d", time.Now().Unix()), 3600)
 
 	log.Printf("✅ Session created: %s", sessionID)
 

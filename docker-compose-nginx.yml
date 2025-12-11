@@ -1,0 +1,97 @@
+version: '3.8'
+
+services:
+  # Nginx Reverse Proxy - Single Entry Point
+  nginx:
+    image: nginx:alpine
+    container_name: sso-nginx-gateway
+    ports:
+      - "8000:80"  # Single port untuk semua aplikasi!
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - keycloak
+      - client-website
+      - sso-admin-portal
+    networks:
+      - sso-network
+
+  # Keycloak (Identity Provider)
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0.6
+    container_name: sso-keycloak
+    environment:
+      KC_DB: postgres
+      KC_DB_URL_HOST: postgres
+      KC_DB_URL_DATABASE: keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak123
+      KC_HOSTNAME: localhost
+      KC_HOSTNAME_STRICT: false
+      KC_HTTP_ENABLED: true
+      KC_HTTP_RELATIVE_PATH: /sso-auth
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    command:
+      - start-dev
+    depends_on:
+      - postgres
+    networks:
+      - sso-network
+    healthcheck:
+      test: ["CMD-SHELL", "(echo > /dev/tcp/127.0.0.1/8080) > /dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Client Website (localhost:8070)
+  client-website:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: sso-client-website
+    environment:
+      PORT: 8070
+      SSO_BASE_URL: http://localhost:8000/sso-auth  # ← Same origin via nginx!
+      SSO_REALM: dinas-pendidikan
+      SSO_CLIENT_ID: localhost-8000-website-client
+      SSO_REDIRECT_URI: http://localhost:8000/client/callback
+      SESSION_SECRET: client-secret-change-this
+    depends_on:
+      - keycloak
+    networks:
+      - sso-network
+
+  # SSO Admin Portal (localhost:3000)
+  sso-admin-portal:
+    image: nginx:alpine
+    container_name: sso-admin-portal
+    volumes:
+      - ./sso-admin:/usr/share/nginx/html:ro
+    networks:
+      - sso-network
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: sso-postgres
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloak123
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - sso-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  sso-network:
+    driver: bridge
+
+volumes:
+  postgres_data:

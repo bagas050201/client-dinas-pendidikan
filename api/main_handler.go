@@ -209,6 +209,14 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			if errorParam == "login_required" || errorParam == "interaction_required" {
 				// User belum login di Keycloak, redirect ke login (tanpa prompt=none)
 				log.Printf("🔄 Auto-login failed (%s), redirecting to Keycloak login form", errorParam)
+
+				// Clear local cookies to ensure clean state
+				helpers.ClearCookie(w, r, "client_dinas_session")
+				helpers.ClearCookie(w, r, "sso_access_token")
+				helpers.ClearCookie(w, r, "sso_id_token")
+				helpers.ClearCookie(w, r, "sso_token_expires")
+				helpers.ClearCookie(w, r, "session_id")
+
 				redirectToKeycloakLogin(w, r, false) // false = tanpa prompt=none
 				return
 			}
@@ -227,9 +235,22 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		
-		// Belum login, check Keycloak session dengan prompt=none
-		log.Printf("🔄 No local session found, checking Keycloak session with prompt=none")
+		// Belum login, mulai flow True SSO (Silent Check)
+		// Redirect ke /auth/check untuk melakukan pengecekan session di background
+		log.Printf("🔄 No local session found, starting True SSO check...")
+		http.Redirect(w, r, "/auth/check", http.StatusSeeOther)
+
+	case "/sso-check":
+		// Endpoint khusus untuk Silent SSO Check
+		// Redirect ke Keycloak dengan prompt=none
+		log.Printf("🕵️ Performing Silent SSO Check (prompt=none)...")
 		redirectToKeycloakLogin(w, r, true) // true = dengan prompt=none
+
+	case "/login-manual":
+		// Endpoint untuk login manual (jika silent check gagal)
+		// Redirect ke Keycloak TANPA prompt=none (tampilkan form login)
+		log.Printf("👤 Performing Manual Login (Standard SSO)...")
+		redirectToKeycloakLogin(w, r, false) // false = tanpa prompt=none
 
 	case "/login":
 		// Gunakan handler baru untuk login
@@ -291,6 +312,14 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	case "/callback":
 		// Handler untuk callback dari OAuth/OIDC (kompatibilitas)
 		handleOAuthCallback(w, r)
+		return
+	case "/auth/check":
+		// Route: Silent Check (sesuai panduan)
+		handleAuthCheck(w, r)
+		return
+	case "/auth/validate":
+		// Route: Validasi Session (Sync Logout)
+		handleAuthValidate(w, r)
 		return
 	default:
 		http.NotFound(w, r)
@@ -421,53 +450,6 @@ func LoginPageHandler(w http.ResponseWriter, r *http.Request) {
 	// Cek apakah user sudah login (cek access token atau session)
 	// PENTING: Jangan redirect jika ada error parameter (untuk menghindari loop)
 	errorParam := r.URL.Query().Get("error")
-
-	// Jika tidak ada error, cek apakah user sudah login
-	if errorParam == "" {
-		accessToken, _ := helpers.GetCookie(r, "sso_access_token")
-		// PENTING: Hanya gunakan cookie client_dinas_session, JANGAN gunakan sso_admin_session dari SSO server
-		sessionID, _ := helpers.GetCookie(r, "client_dinas_session")
-		// Fallback ke session_id untuk backward compatibility (cookie lama dari direct login)
-		if sessionID == "" {
-			sessionID, _ = helpers.GetCookie(r, "session_id")
-		}
-
-		// Cek access token expiration jika ada
-		if accessToken != "" {
-			tokenExpiresStr, _ := helpers.GetCookie(r, "sso_token_expires")
-			if tokenExpiresStr != "" {
-				if tokenExpires, err := strconv.ParseInt(tokenExpiresStr, 10, 64); err == nil {
-					if time.Now().Unix() <= tokenExpires {
-						// Access token valid, redirect
-						next := r.URL.Query().Get("next")
-						if next == "" {
-							next = "/dashboard"
-						}
-						log.Printf("✅ Access token valid, redirect ke: %s", next)
-						http.Redirect(w, r, next, http.StatusSeeOther)
-						return
-					}
-				}
-			}
-		}
-
-		// Cek session jika ada (gunakan validateSession lokal)
-		if sessionID != "" {
-			userID, ok, err := validateSession(sessionID)
-			if ok && err == nil && userID != "" {
-				// Session valid, redirect ke dashboard
-				next := r.URL.Query().Get("next")
-				if next == "" {
-					next = "/dashboard"
-				}
-				log.Printf("✅ Session valid, redirect ke: %s", next)
-				http.Redirect(w, r, next, http.StatusSeeOther)
-				return
-			}
-		}
-	}
-
-	// Ambil error message dari query parameter (untuk error dari SSO callback)
 	errorMsg := ""
 	messageParam := r.URL.Query().Get("message")
 
@@ -499,6 +481,9 @@ func LoginPageHandler(w http.ResponseWriter, r *http.Request) {
 			errorMsg = "Token sudah expired. Silakan login lagi."
 		case "no_token":
 			errorMsg = "Tidak ada access token. Silakan login."
+		case "login_required", "interaction_required":
+			// Silent SSO failed, user needs to login manually.
+			log.Printf("ℹ️ Silent SSO check returned %s, showing login form", errorParam)
 		default:
 			if messageParam != "" {
 				errorMsg = messageParam
@@ -815,52 +800,6 @@ func DashboardHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // renderDashboardWithToken render dashboard setelah token validated
-func renderDashboardWithToken(w http.ResponseWriter, r *http.Request) {
-	// Cek session (gunakan cookie name yang berbeda dari SSO server)
-	// PENTING: Hanya gunakan cookie client_dinas_session, JANGAN gunakan sso_admin_session dari SSO server
-	sessionID, err := helpers.GetCookie(r, "client_dinas_session")
-	if err != nil {
-		// Fallback ke session_id untuk backward compatibility (cookie lama dari direct login)
-		sessionID, err = helpers.GetCookie(r, "session_id")
-	}
-	var userID string
-	var ok bool
-
-	if err == nil && sessionID != "" {
-		// Validasi session jika ada (gunakan fungsi PostgreSQL lokal)
-		userID, ok, _ = validateSession(sessionID)
-		log.Printf("🔍 renderDashboardWithToken: session validation result - userID: %s, ok: %v", userID, ok)
-	}
-
-	// Ambil data user jika session ada
-	var user map[string]interface{}
-	if ok && userID != "" {
-		user, err = getUserByIDForDashboard(userID)
-		if err != nil {
-			log.Printf("WARNING: Error getting user: %v", err)
-			// Lanjutkan dengan user kosong
-			user = make(map[string]interface{})
-		}
-	} else {
-		// Jika tidak ada session, gunakan user kosong
-		user = make(map[string]interface{})
-	}
-
-	// Ambil counts untuk dashboard
-	counts, err := getDashboardCounts()
-	if err != nil {
-		log.Printf("WARNING: Error getting counts: %v", err)
-		counts = map[string]int{
-			"pengguna": 0,
-			"aplikasi": 0,
-			"sessions": 0,
-			"tokens":   0,
-		}
-	}
-
-	// Render dashboard
-	renderDashboardPage(w, user, counts)
-}
 
 // getUserByID mengambil data user dari Supabase berdasarkan ID
 func getUserByID(userID string) (map[string]interface{}, error) {
@@ -906,44 +845,78 @@ func getUserByID(userID string) (map[string]interface{}, error) {
 	return users[0], nil
 }
 
-// getUserByIDForDashboard mengambil data user dari Supabase berdasarkan ID
-func getUserByIDForDashboard(userID string) (map[string]interface{}, error) {
+// getUserBySSOIdentifier mengambil data user dari PostgreSQL berdasarkan ID, NRK, atau NIK
+func getUserBySSOIdentifier(identifier string) (map[string]interface{}, error) {
 	// Ambil data user dari PostgreSQL database
-	log.Printf("🔍 getUserByIDForDashboard: getting user data for ID: %s", userID)
+	log.Printf("🔍 getUserBySSOIdentifier: getting user data for identifier: %s", identifier)
 
 	db, err := connectPostgreSQL()
 	if err != nil {
-		log.Printf("❌ getUserByIDForDashboard: failed to connect to PostgreSQL: %v", err)
+		log.Printf("❌ getUserBySSOIdentifier: failed to connect to PostgreSQL: %v", err)
 		return nil, fmt.Errorf("failed to connect to PostgreSQL: %v", err)
 	}
 	defer db.Close()
 
-	// Query user from PostgreSQL
-	query := `SELECT id_pengguna, email, nama_lengkap, peran, aktif FROM pengguna WHERE id_pengguna = $1`
+	// Query user from PostgreSQL (Schema Baru: account.za_users)
+	// Kita cari berdasarkan ID, NRK, atau NIK
+	query := `
+		SELECT id, email, nickname, fullname, role_id, is_active, nrk, nik 
+		FROM account.za_users 
+		WHERE id = $1 OR nrk = $1 OR nik = $1
+	`
 
-	var user map[string]interface{}
-	var idPengguna, email, namaLengkap, peran string
-	var aktif bool
+	var userStruct struct {
+		ID          string         `json:"id"`
+		Email       sql.NullString `json:"email"`
+		Nickname    sql.NullString `json:"nickname"`
+		Fullname    sql.NullString `json:"fullname"`
+		RoleID      sql.NullString `json:"role_id"`
+		IsActive    string         `json:"is_active"`
+		NRK         sql.NullString `json:"nrk"`
+		NIK         sql.NullString `json:"nik"`
+	}
 
-	err = db.QueryRow(query, userID).Scan(&idPengguna, &email, &namaLengkap, &peran, &aktif)
+	err = db.QueryRow(query, identifier).Scan(
+		&userStruct.ID,
+		&userStruct.Email,
+		&userStruct.Nickname,
+		&userStruct.Fullname,
+		&userStruct.RoleID,
+		&userStruct.IsActive,
+		&userStruct.NRK,
+		&userStruct.NIK,
+	)
+
 	if err != nil {
 		if err == sql.ErrNoRows {
-			log.Printf("❌ getUserByIDForDashboard: user not found for ID: %s", userID)
+			log.Printf("❌ getUserBySSOIdentifier: user not found for identifier: %s", identifier)
 			return nil, fmt.Errorf("user not found")
 		}
-		log.Printf("❌ getUserByIDForDashboard: error querying user: %v", err)
+		log.Printf("❌ getUserBySSOIdentifier: error querying user: %v", err)
 		return nil, fmt.Errorf("error querying user: %v", err)
 	}
 
-	user = map[string]interface{}{
-		"id_pengguna":  idPengguna,
-		"email":        email,
-		"nama_lengkap": namaLengkap,
-		"peran":        peran,
-		"aktif":        aktif,
+	user := map[string]interface{}{
+		"id_pengguna":   userStruct.ID,
+		"email":         userStruct.Email.String,
+		"nama_pengguna": userStruct.Nickname.String,
+		"nama_lengkap":  userStruct.Fullname.String,
+		"peran":         userStruct.RoleID.String,
+		"aktif":         userStruct.IsActive == "1",
+		"nrk":           userStruct.NRK.String,
+		"nik":           userStruct.NIK.String,
 	}
 
-	log.Printf("✅ getUserByIDForDashboard: found user: %s (%s)", namaLengkap, email)
+	// Fallback jika nama_lengkap kosong, gunakan nickname
+	if user["nama_lengkap"] == "" {
+		user["nama_lengkap"] = user["nama_pengguna"]
+	}
+	// Fallback jika peran kosong, set default user
+	if user["peran"] == "" {
+		user["peran"] = "user"
+	}
+
+	log.Printf("✅ getUserBySSOIdentifier: found user: %s (%s)", user["nama_lengkap"], user["email"])
 	return user, nil
 }
 
@@ -967,46 +940,284 @@ func getDashboardCounts() (map[string]int, error) {
 	return counts, nil
 }
 
-// renderDashboardPage menampilkan halaman dashboard
-func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, counts map[string]int) {
-	logoBase64 := base64.StdEncoding.EncodeToString(LogoData)
-	userName := "User"
-	userEmail := ""
-	userRole := "user"
-	userStatus := "Aktif"
-	roleBadgeClass := "user"
-
-	if name, ok := user["nama_lengkap"].(string); ok && name != "" {
-		userName = name
-	} else if email, ok := user["email"].(string); ok {
-		userName = email
+// renderDashboardWithToken render dashboard setelah token validated
+func renderDashboardWithToken(w http.ResponseWriter, r *http.Request) {
+	// Cek session (gunakan cookie name yang berbeda dari SSO server)
+	// PENTING: Hanya gunakan cookie client_dinas_session, JANGAN gunakan sso_admin_session dari SSO server
+	sessionID, err := helpers.GetCookie(r, "client_dinas_session")
+	if err != nil {
+		// Fallback ke session_id untuk backward compatibility (cookie lama dari direct login)
+		sessionID, err = helpers.GetCookie(r, "session_id")
 	}
+	var userID string
+	var ok bool
 
-	if email, ok := user["email"].(string); ok && email != "" {
-		userEmail = email
-	}
-
-	if peran, ok := user["peran"].(string); ok && peran != "" {
-		userRole = peran
-		// Set badge class berdasarkan peran
-		switch strings.ToLower(peran) {
-		case "admin":
-			roleBadgeClass = "admin"
-		case "guru", "wali", "murid":
-			roleBadgeClass = "user"
-		default:
-			roleBadgeClass = "user"
+	if err == nil && sessionID != "" {
+		// Validate session using local PostgreSQL connection
+		userID, ok, err = validateSession(sessionID)
+		if !ok || err != nil {
+			log.Printf("WARNING: Session invalid: %v, error: %v", ok, err)
+			// Jangan redirect dulu, coba render dengan user kosong
+			userID = ""
 		}
 	}
 
-	if aktif, ok := user["aktif"].(bool); ok && !aktif {
-		userStatus = "Tidak Aktif"
+	// ---------------------------------------------------------
+	// PERIODIC SSO CHECK (Prompt=None)
+	// ---------------------------------------------------------
+	// Cek apakah kita perlu melakukan re-validasi ke SSO (setiap 1 menit)
+	// Ini untuk menangani kasus user logout dari SSO atau ganti user
+	checkTimeStr, err := helpers.GetCookie(r, "sso_check_time")
+	shouldCheck := false
+	
+	if err != nil || checkTimeStr == "" {
+		// Cookie tidak ada, set cookie baru tapi JANGAN check dulu (grace period)
+		// Ini mencegah loop jika browser memblokir cookie atau delay network
+		log.Printf("ℹ️ sso_check_time missing, setting new cookie and skipping check")
+		helpers.SetCookie(w, r, "sso_check_time", fmt.Sprintf("%d", time.Now().Unix()), 3600)
+	} else {
+		// Cookie ada, cek umurnya
+		if checkTime, err := strconv.ParseInt(checkTimeStr, 10, 64); err == nil {
+			// Jika check terakhir lebih dari 60 detik yang lalu, lakukan check
+			if time.Now().Unix() - checkTime > 60 {
+				shouldCheck = true
+			}
+		}
 	}
 
-	// Get initial for avatar
-	avatarInitial := "U"
-	if len(userName) > 0 {
-		avatarInitial = strings.ToUpper(string(userName[0]))
+	if shouldCheck {
+		log.Printf("🔄 Periodic SSO Check triggered. Redirecting to /auth/check")
+		http.Redirect(w, r, "/auth/check", http.StatusSeeOther)
+		return
+	}
+
+	// ---------------------------------------------------------
+	// VALIDASI SESSION KE KEYCLOAK (Check SSO Logout)
+	// ---------------------------------------------------------
+	// Cek apakah user masih login di SSO server dengan memanggil UserInfo endpoint
+	accessToken, _ := helpers.GetCookie(r, "sso_access_token")
+	if accessToken != "" {
+		userInfoURL := os.Getenv("SSO_USERINFO_URL")
+		if userInfoURL == "" {
+			// Fallback URL construction if env not set
+			ssoURL := os.Getenv("SSO_URL")
+			realm := os.Getenv("SSO_REALM")
+			if ssoURL != "" && realm != "" {
+				userInfoURL = fmt.Sprintf("%s/realms/%s/protocol/openid-connect/userinfo", ssoURL, realm)
+			}
+		}
+
+		if userInfoURL != "" {
+			client := &http.Client{Timeout: 5 * time.Second}
+			req, _ := http.NewRequest("GET", userInfoURL, nil)
+			req.Header.Set("Authorization", "Bearer "+accessToken)
+			resp, err := client.Do(req)
+			
+			if err != nil {
+				log.Printf("WARNING: Failed to check SSO session: %v", err)
+				// Network error, maybe allow to proceed or show warning? 
+				// For now, proceed with local session.
+			} else {
+				defer resp.Body.Close()
+				if resp.StatusCode == http.StatusUnauthorized {
+					log.Printf("❌ SSO Session Expired/Invalid (401 from UserInfo). Logging out locally.")
+					
+					// Clear local cookies
+					helpers.ClearCookie(w, r, "client_dinas_session")
+					helpers.ClearCookie(w, r, "sso_access_token")
+					helpers.ClearCookie(w, r, "sso_id_token")
+					helpers.ClearCookie(w, r, "sso_token_expires")
+					helpers.ClearCookie(w, r, "session_id")
+
+					// Redirect to login
+					http.Redirect(w, r, "/login?error=session_expired", http.StatusSeeOther)
+					return
+				} else if resp.StatusCode == http.StatusOK {
+					log.Printf("✅ SSO Session Valid (Verified with UserInfo)")
+				}
+			}
+		}
+	} else {
+		// Access token is missing, but we are in a protected route (dashboard).
+		// This means we have a local session but no SSO token.
+		// We should verify with SSO if the user is still logged in.
+		log.Printf("⚠️ SSO Access Token missing in dashboard. Redirecting to /sso-check to re-verify.")
+		http.Redirect(w, r, "/sso-check", http.StatusSeeOther)
+		return
+	}
+
+	// Extract SSO Claims from ID Token Cookie FIRST to get the identifier if session is missing
+	ssoClaims := make(map[string]interface{})
+	idToken, err := helpers.GetCookie(r, "sso_id_token")
+	if err == nil && idToken != "" {
+		// Parse JWT token (without verification for display purposes)
+		parts := strings.Split(idToken, ".")
+		if len(parts) == 3 {
+			payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+			if err == nil {
+				json.Unmarshal(payload, &ssoClaims)
+			}
+		}
+	}
+
+	var user map[string]interface{}
+	
+	// Strategy 1: Try to get user from Session ID (Local Login)
+	if userID != "" {
+		user, err = getUserBySSOIdentifier(userID)
+		if err != nil {
+			log.Printf("WARNING: Error getting user by ID: %v", err)
+		}
+	}
+
+	// Strategy 2: If user not found via session, try to find via SSO 'sub' claim
+	// Format sub: "f:component_id:identifier" -> we need the last part
+	if user == nil && len(ssoClaims) > 0 {
+		if sub, ok := ssoClaims["sub"].(string); ok && sub != "" {
+			parts := strings.Split(sub, ":")
+			if len(parts) > 0 {
+				identifier := parts[len(parts)-1] // Get the last part (e.g., "111111")
+				log.Printf("🔄 Attempting to find user by SSO sub identifier: %s", identifier)
+				user, err = getUserBySSOIdentifier(identifier)
+				if err != nil {
+					log.Printf("WARNING: Error getting user by SSO identifier: %v", err)
+				}
+			}
+		}
+	}
+
+	// If still no user, initialize empty map
+	if user == nil {
+		user = make(map[string]interface{})
+	}
+
+	// Ambil counts untuk dashboard
+	counts, err := getDashboardCounts()
+	if err != nil {
+		log.Printf("WARNING: Error getting counts: %v", err)
+		counts = map[string]int{
+			"pengguna": 0,
+			"aplikasi": 0,
+			"sessions": 0,
+			"tokens":   0,
+		}
+	}
+
+	// Render dashboard
+	renderDashboardPage(w, user, counts, ssoClaims)
+}
+
+// renderDashboardPage menampilkan halaman dashboard
+
+// renderDashboardPage generates the HTML for the dashboard page.
+func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, counts map[string]int, ssoClaims map[string]interface{}) {
+	logoBase64 := base64.StdEncoding.EncodeToString(LogoData)
+
+	userName := ""
+	userEmail := ""
+	avatarInitial := ""
+	userRole := "User"
+	roleBadgeClass := "user"
+	userStatus := "Unknown"
+	statusBadgeClass := ""
+	nrk := "-"
+	unitKerja := "-"
+
+	// Try to get info from SSO claims first
+	if ssoClaims != nil {
+		if name, ok := ssoClaims["name"].(string); ok {
+			userName = name
+			if len(name) > 0 {
+				avatarInitial = strings.ToUpper(string(name[0]))
+			}
+		}
+		if email, ok := ssoClaims["email"].(string); ok {
+			userEmail = email
+		}
+		if emailVerified, ok := ssoClaims["email_verified"].(bool); ok {
+			if emailVerified {
+				userStatus = "Verified"
+				statusBadgeClass = "verified"
+			} else {
+				userStatus = "Not Verified"
+				statusBadgeClass = "inactive"
+			}
+		}
+
+		// Extract 'pegawai' object
+		if pegawaiData, ok := ssoClaims["pegawai"].(map[string]interface{}); ok {
+			if nrkVal, ok := pegawaiData["nrk"].(string); ok && nrkVal != "" {
+				nrk = nrkVal
+			}
+			if roleVal, ok := pegawaiData["role"].(string); ok && roleVal != "" {
+				userRole = roleVal
+				if strings.ToLower(roleVal) == "admin" {
+					roleBadgeClass = "admin"
+				} else {
+					roleBadgeClass = "user"
+				}
+			}
+			if groupVal, ok := pegawaiData["group"].(string); ok && groupVal != "" {
+				unitKerja = groupVal
+			}
+		} else if roleID, ok := ssoClaims["role_id"].(string); ok { // Fallback to role_id if pegawai.role is not present
+			userRole = roleID
+			if strings.ToLower(roleID) == "admin" {
+				roleBadgeClass = "admin"
+			} else {
+				roleBadgeClass = "user"
+			}
+		}
+	}
+
+	// Fallback to local user data if SSO claims are missing some info
+	if userName == "" {
+		if name, ok := user["nama_lengkap"].(string); ok {
+			userName = name
+			if len(name) > 0 {
+				avatarInitial = strings.ToUpper(string(name[0]))
+			}
+		}
+	}
+	if userEmail == "" {
+		if email, ok := user["email"].(string); ok {
+			userEmail = email
+		}
+	}
+	if userRole == "User" { // Only fallback if not set by SSO
+		if role, ok := user["peran"].(string); ok {
+			userRole = role
+			if strings.ToLower(role) == "admin" {
+				roleBadgeClass = "admin"
+			} else {
+				roleBadgeClass = "user"
+			}
+		}
+	}
+	if userStatus == "Unknown" { // Only fallback if not set by SSO
+		if active, ok := user["aktif"].(bool); ok {
+			if active {
+				userStatus = "Aktif"
+				statusBadgeClass = "verified"
+			} else {
+				userStatus = "Tidak Aktif"
+				statusBadgeClass = "inactive"
+			}
+		}
+	}
+	
+	// Fallback for NRK from local DB
+	if nrk == "-" {
+		if val, ok := user["nrk"].(string); ok && val != "" {
+			nrk = val
+		}
+	}
+
+	// Prepare JSON payload for display
+	jsonBytes, err := json.MarshalIndent(ssoClaims, "", "  ")
+	jsonPayload := "Tidak ada data SSO."
+	if err == nil && len(ssoClaims) > 0 {
+		jsonPayload = string(jsonBytes)
 	}
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
@@ -1054,7 +1265,7 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
             align-items: center;
             gap: 8px;
             cursor: pointer;
-            padding: 8px 12px;
+            padding: 4px 8px;
             border-radius: 8px;
             transition: background 0.2s;
         }
@@ -1066,6 +1277,7 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
             height: 32px;
             border-radius: 50%%;
             background: #3b82f6;
+            color: white;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -1078,21 +1290,101 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
             padding: 24px;
         }
         .welcome-section {
-            background: white;
+            background: linear-gradient(135deg, #3b82f6 0%%, #1e40af 100%%);
+            color: white;
             border-radius: 12px;
-            padding: 32px;
-            margin-bottom: 24px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            padding: 48px;
+            margin-bottom: 32px;
+            text-align: center;
         }
         .welcome-title {
-            font-size: 28px;
-            font-weight: 600;
-            color: #1e293b;
+            font-size: 36px;
+            font-weight: 700;
             margin-bottom: 8px;
         }
         .welcome-subtitle {
+            font-size: 18px;
+            opacity: 0.9;
+        }
+        .info-card {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 24px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .info-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 24px;
+        }
+        .info-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #1e293b;
+        }
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 24px;
+        }
+        .info-item label {
+            display: block;
+            font-size: 12px;
+            font-weight: 600;
             color: #64748b;
+            margin-bottom: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .info-item div {
             font-size: 16px;
+            color: #1e293b;
+            font-weight: 500;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 9999px;
+            font-size: 12px;
+            font-weight: 600;
+            background: #dcfce7;
+            color: #166534;
+        }
+        .status-badge.inactive {
+            background: #fee2e2;
+            color: #dc2626;
+        }
+        .role-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        .role-badge.user {
+            background: #e0e7ff;
+            color: #4338ca;
+        }
+        .role-badge.admin {
+            background: #fef3c7;
+            color: #92400e;
+        }
+        .role-badge.inactive {
+            background: #e5e7eb;
+            color: #4b5563;
+        }
+        .json-dump {
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 16px;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 12px;
+            overflow-x: auto;
+            margin-top: 16px;
+            white-space: pre-wrap;
         }
         .stats-grid {
             display: grid;
@@ -1239,176 +1531,126 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
             <h1 class="welcome-title" id="welcomeTitle">Selamat Datang, %s!</h1>
             <p class="welcome-subtitle">Dashboard Sistem Informasi Dinas Pendidikan</p>
         </div>
-        <div class="sso-info-card">
-            <h2 class="sso-info-title">👤 Informasi User</h2>
-            <div class="sso-info-grid">
-                <div class="sso-info-item">
-                    <div class="sso-info-label">Nama Lengkap</div>
-                    <div class="sso-info-value">%s</div>
+        <div class="info-card">
+            <div class="info-header">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: #3b82f6;">
+                    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                    <circle cx="12" cy="7" r="4"></circle>
+                </svg>
+                <h2 class="info-title">Informasi User</h2>
             </div>
-                <div class="sso-info-item">
-                    <div class="sso-info-label">Email</div>
-                    <div class="sso-info-value">%s</div>
-        </div>
-                <div class="sso-info-item">
-                    <div class="sso-info-label">Peran</div>
-                    <div class="sso-info-value">
-                        <span class="sso-info-badge %s">%s</span>
-            </div>
-            </div>
-                <div class="sso-info-item">
-                    <div class="sso-info-label">Status</div>
-                    <div class="sso-info-value">
-                        <span class="sso-info-badge verified">%s</span>
-            </div>
+            <div class="info-grid">
+                <div class="info-item">
+                    <label>Nama Lengkap</label>
+                    <div>%s</div>
+                </div>
+                <div class="info-item">
+                    <label>Email</label>
+                    <div>%s</div>
+                </div>
+                <div class="info-item">
+                    <label>NRK</label>
+                    <div>%s</div>
+                </div>
+                <div class="info-item">
+                    <label>Unit Kerja</label>
+                    <div>%s</div>
+                </div>
+                <div class="info-item">
+                    <label>Peran</label>
+                    <div><span class="role-badge %s">%s</span></div>
+                </div>
+                <div class="info-item">
+                    <label>Status</label>
+                    <div><span class="status-badge %s">%s</span></div>
                 </div>
             </div>
         </div>
+
+        <div class="info-card">
+             <div class="info-header">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: #3b82f6;">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                    <polyline points="14 2 14 8 20 8"></polyline>
+                    <line x1="16" y1="13" x2="8" y2="13"></line>
+                    <line x1="16" y1="17" x2="8" y2="17"></line>
+                    <polyline points="10 9 9 9 8 9"></polyline>
+                </svg>
+                <h2 class="info-title">Informasi Data User (Keycloak Payload)</h2>
+            </div>
+            <div class="json-dump">%s</div>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Total Pengguna</div>
+                <div class="stat-value">%d</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Aplikasi Terhubung</div>
+                <div class="stat-value">%d</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Sesi Aktif</div>
+                <div class="stat-value">%d</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Token Valid</div>
+                <div class="stat-value">%d</div>
+            </div>
+        </div>
+
         <div class="actions-grid">
             <a href="/info-dinas" class="action-card">
-                <div class="action-title">📋 Informasi Dinas</div>
+                <div class="action-title">📝 Informasi Dinas</div>
                 <div class="action-desc">Lihat informasi lengkap tentang Dinas Pendidikan DKI Jakarta</div>
             </a>
             <a href="/profile" class="action-card">
                 <div class="action-title">👤 Profil Saya</div>
                 <div class="action-desc">Kelola informasi profil dan pengaturan akun</div>
             </a>
-            <a href="/news" class="action-card">
+            <a href="/api/news" class="action-card">
                 <div class="action-title">📰 Berita & Pengumuman</div>
                 <div class="action-desc">Baca berita dan pengumuman terbaru</div>
             </a>
-            <a href="/services" class="action-card">
+            <a href="#" class="action-card">
                 <div class="action-title">🛠️ Layanan</div>
                 <div class="action-desc">Akses berbagai layanan yang tersedia</div>
             </a>
         </div>
     </div>
+
     <script>
-        // Update header dan welcome message dengan data SSO dari sessionStorage
-        function updateUserDisplayFromSSO() {
-            try {
-                const ssoUserInfoStr = sessionStorage.getItem('sso_user_info');
-                if (!ssoUserInfoStr) {
-                    console.log('No SSO user info found in sessionStorage, using server data');
-                    return;
-                }
-                
-                const ssoUserInfo = JSON.parse(ssoUserInfoStr);
-                
-                // Update nama di header (navbar)
-                const userNameSpan = document.querySelector('.user-menu span');
-                if (userNameSpan && ssoUserInfo.name) {
-                    userNameSpan.textContent = ssoUserInfo.name;
-                    console.log('✅ Updated header name to:', ssoUserInfo.name);
-                }
-                
-                // Update avatar initial
-                const userAvatar = document.querySelector('.user-avatar');
-                if (userAvatar && ssoUserInfo.name) {
-                    const initial = ssoUserInfo.name.charAt(0).toUpperCase();
-                    userAvatar.textContent = initial;
-                    console.log('✅ Updated avatar initial to:', initial);
-                }
-                
-                // Update welcome message
-                const welcomeTitle = document.querySelector('.welcome-title');
-                if (welcomeTitle && ssoUserInfo.name) {
-                    welcomeTitle.textContent = 'Selamat Datang, ' + ssoUserInfo.name + '!';
-                    console.log('✅ Updated welcome message to:', ssoUserInfo.name);
-                }
-            } catch (error) {
-                console.error('Error updating user display from SSO:', error);
-            }
+        // Store SSO user info in sessionStorage for other pages
+        const ssoUserInfo = %s;
+        if (ssoUserInfo && Object.keys(ssoUserInfo).length > 0) {
+            sessionStorage.setItem('sso_user_info', JSON.stringify(ssoUserInfo));
+        }
+
+        // Sync Logout Check (Periodic)
+        function checkSession() {
+            fetch('/auth/validate').then(res => {
+                if (res.status === 401) window.location.reload();
+            }).catch(e => console.error("Session check failed", e));
         }
         
-        // Tampilkan data SSO User Info dari sessionStorage
-        function displaySSOUserInfo() {
-            try {
-                const ssoUserInfoStr = sessionStorage.getItem('sso_user_info');
-                if (!ssoUserInfoStr) {
-                    console.log('No SSO user info found in sessionStorage');
-                    return;
-                }
-                
-                const ssoUserInfo = JSON.parse(ssoUserInfoStr);
-                const card = document.getElementById('ssoInfoCard');
-                const grid = document.getElementById('ssoInfoGrid');
-                
-                if (!card || !grid) return;
-                
-                // Tampilkan card
-                card.style.display = 'block';
-                
-                // Clear existing content
-                grid.innerHTML = '';
-                
-                // Helper function untuk membuat info item
-                function createInfoItem(label, value, badgeClass) {
-                    const item = document.createElement('div');
-                    item.className = 'sso-info-item';
-                    
-                    const labelEl = document.createElement('div');
-                    labelEl.className = 'sso-info-label';
-                    labelEl.textContent = label;
-                    
-                    const valueEl = document.createElement('div');
-                    valueEl.className = 'sso-info-value';
-                    
-                    if (badgeClass) {
-                        const badge = document.createElement('span');
-                        badge.className = 'sso-info-badge ' + badgeClass;
-                        badge.textContent = value;
-                        valueEl.appendChild(badge);
-                    } else {
-                        valueEl.textContent = value || '-';
-                    }
-                    
-                    item.appendChild(labelEl);
-                    item.appendChild(valueEl);
-                    return item;
-                }
-                
-                // Tampilkan data
-                if (ssoUserInfo.id_user) {
-                    grid.appendChild(createInfoItem('ID User', ssoUserInfo.id_user));
-                }
-                if (ssoUserInfo.email) {
-                    grid.appendChild(createInfoItem('Email', ssoUserInfo.email));
-                }
-                if (ssoUserInfo.name) {
-                    grid.appendChild(createInfoItem('Nama', ssoUserInfo.name));
-                }
-                if (ssoUserInfo.preferred_username) {
-                    grid.appendChild(createInfoItem('Username', ssoUserInfo.preferred_username));
-                }
-                if (ssoUserInfo.email_verified !== undefined) {
-                    grid.appendChild(createInfoItem('Email Verified', ssoUserInfo.email_verified ? 'Verified' : 'Not Verified', 
-                        ssoUserInfo.email_verified ? 'verified' : ''));
-                }
-                if (ssoUserInfo.peran) {
-                    const peranClass = ssoUserInfo.peran === 'admin' ? 'admin' : 'user';
-                    grid.appendChild(createInfoItem('Peran', ssoUserInfo.peran, peranClass));
-                }
-                
-                console.log('✅ SSO User Info displayed:', ssoUserInfo);
-            } catch (error) {
-                console.error('Error displaying SSO user info:', error);
-            }
-        }
+        // Check on load
+        checkSession();
         
-        // Jalankan saat page load
-        document.addEventListener('DOMContentLoaded', function() {
-            // Update header dan welcome message terlebih dahulu
-            updateUserDisplayFromSSO();
-        });
+        // Check every 30 seconds
+        setInterval(checkSession, 30000);
+        
+        // Check on window focus
+        window.addEventListener('focus', checkSession);
     </script>
 </body>
-</html>`, logoBase64, avatarInitial, userName, userName, userName, userEmail, roleBadgeClass, userRole, userStatus)
+</html>`, logoBase64, avatarInitial, userName, userName, userName, userEmail, nrk, unitKerja, roleBadgeClass, userRole, statusBadgeClass, userStatus, jsonPayload, counts["pengguna"], counts["aplikasi"], counts["sessions"], counts["tokens"], jsonPayload)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(html))
 }
+
 
 // InfoDinasHandler menampilkan halaman Informasi Dinas Pendidikan
 // Protected route: hanya bisa diakses oleh user yang sudah login
@@ -1809,6 +2051,7 @@ func renderInfoDinasPage(w http.ResponseWriter, apps []map[string]interface{}, s
 // SSOConfig menyimpan konfigurasi SSO
 type SSOConfig struct {
 	SSOServerURL string
+	Realm        string // Realm name (e.g., dinas-pendidikan)
 	ClientID     string
 	RedirectURI  string
 	StateSecret  string // Untuk validasi state
@@ -1852,6 +2095,7 @@ func getSSOConfig() SSOConfig {
 
 	return SSOConfig{
 		SSOServerURL: ssoServerURL,
+		Realm:        getEnvOrDefault("SSO_REALM", "dinas-pendidikan"),
 		ClientID:     getEnvOrDefault("SSO_CLIENT_ID", "client-dinas-pendidikan"),
 		RedirectURI:  redirectURI,
 		StateSecret:  getEnvOrDefault("SSO_STATE_SECRET", ""),
@@ -1907,6 +2151,7 @@ type TokenResponse struct {
 	TokenType   string `json:"token_type"`
 	ExpiresIn   int    `json:"expires_in"`
 	Scope       string `json:"scope"`
+	IDToken     string `json:"id_token"`
 }
 
 // UserInfo menyimpan informasi user dari SSO
@@ -2021,7 +2266,11 @@ func exchangeCodeForToken(code string, config SSOConfig) (*TokenResponse, error)
 
 // getUserInfoFromSSO mengambil informasi user dari SSO menggunakan access token
 func getUserInfoFromSSO(accessToken string, config SSOConfig) (*UserInfo, error) {
-	userInfoURL := fmt.Sprintf("%s/oauth/userinfo", config.SSOServerURL)
+	userInfoURL := fmt.Sprintf("%s/sso-auth/realms/%s/protocol/openid-connect/userinfo", config.SSOServerURL, config.Realm)
+	// Fallback URL construction if env not set correctly
+	if config.Realm == "" {
+		userInfoURL = fmt.Sprintf("%s/oauth/userinfo", config.SSOServerURL)
+	}
 
 	req, err := http.NewRequest("GET", userInfoURL, nil)
 	if err != nil {
@@ -2046,175 +2295,92 @@ func getUserInfoFromSSO(accessToken string, config SSOConfig) (*UserInfo, error)
 	// Log raw response untuk debugging
 	log.Printf("📥 SSO userinfo raw response: %s", string(bodyBytes))
 
-	var userInfo UserInfo
-	if err := json.Unmarshal(bodyBytes, &userInfo); err != nil {
-		log.Printf("ERROR parsing userinfo response: %v, Body: %s", err, string(bodyBytes))
+	var rawResponse map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &rawResponse); err != nil {
 		return nil, fmt.Errorf("gagal parse userinfo response: %v", err)
 	}
 
-	// Log user info untuk debugging
-	log.Printf("📋 User info from SSO (parsed):")
-	log.Printf("   Email: %s", userInfo.Email)
+	userInfo := &UserInfo{}
+
+	// ---------------------------------------------------------
+	// PARSING DATA STRUCTURE (NEW FORMAT)
+	// ---------------------------------------------------------
+	// Format Baru:
+	// {
+	//   "data": {
+	//     "pengguna": { "nama": "...", "email": "...", "id_pengguna": "..." },
+	//     "jabatan": { "role": "...", "level": "..." },
+	//     "identitas": { "nik": "...", "nip": "..." },
+	//     ...
+	//   },
+	//   "name": "...",
+	//   "email": "...",
+	//   "preferred_username": "..."
+	// }
+	
+	// 1. Coba ambil dari `data` object (Structure Baru)
+	if data, ok := rawResponse["data"].(map[string]interface{}); ok {
+		// Pengguna
+		if pengguna, ok := data["pengguna"].(map[string]interface{}); ok {
+			if val, ok := pengguna["nama"].(string); ok { userInfo.Name = val }
+			if val, ok := pengguna["email"].(string); ok { userInfo.Email = val }
+			// Mapping ID Pengguna?
+		}
+		// Jabatan
+		if jabatan, ok := data["jabatan"].(map[string]interface{}); ok {
+			if val, ok := jabatan["role"].(string); ok { userInfo.Role = val; userInfo.Peran = val }
+		}
+	}
+
+	// 2. Fallback ke standard OIDC fields (jika `data` kosong atau parsial)
+	if userInfo.Name == "" {
+		if val, ok := rawResponse["name"].(string); ok { userInfo.Name = val }
+	}
+	if userInfo.Email == "" {
+		if val, ok := rawResponse["email"].(string); ok { userInfo.Email = val }
+	}
+	if userInfo.Sub == "" {
+		if val, ok := rawResponse["sub"].(string); ok { userInfo.Sub = val }
+	}
+	if userInfo.Role == "" {
+		// Coba ambil dari realm_access.roles atau resource_access
+		// (Implementasi sederhana, sesuaikan jika perlu)
+	}
+
+	// Log hasil parsing
+	log.Printf("📋 User info parsed:")
 	log.Printf("   Name: %s", userInfo.Name)
-	log.Printf("   Sub: %s", userInfo.Sub)
-	log.Printf("   Peran: %s", userInfo.Peran)
+	log.Printf("   Email: %s", userInfo.Email)
 	log.Printf("   Role: %s", userInfo.Role)
 
-	// Parse field tambahan dari raw response jika tidak ada di struct
-	var rawResponse map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &rawResponse); err == nil {
-		// Parse Email dari berbagai field yang mungkin (PENTING: email wajib ada)
-		if userInfo.Email == "" {
-			// Coba berbagai field name untuk email
-			if email, ok := rawResponse["email"].(string); ok && email != "" {
-				userInfo.Email = email
-				log.Printf("   ✅ Found email from 'email': %s", email)
-			} else if email, ok := rawResponse["user_email"].(string); ok && email != "" {
-				userInfo.Email = email
-				log.Printf("   ✅ Found email from 'user_email': %s", email)
-			} else if email, ok := rawResponse["mail"].(string); ok && email != "" {
-				userInfo.Email = email
-				log.Printf("   ✅ Found email from 'mail': %s", email)
-			} else if sub, ok := rawResponse["sub"].(string); ok && sub != "" {
-				// Jika sub adalah email (biasanya di OAuth 2.0)
-				if strings.Contains(sub, "@") {
-					userInfo.Email = sub
-					log.Printf("   ✅ Found email from 'sub' (as email): %s", sub)
-				}
-			} else {
-				log.Printf("   ❌ Email not found in response. Available fields: %v", getMapKeys(rawResponse))
-				log.Printf("   📋 Full response: %s", string(bodyBytes))
-			}
-		}
+	return userInfo, nil
+}
 
-		// Parse Name dari berbagai field yang mungkin
-		if userInfo.Name == "" {
-			if name, ok := rawResponse["nama_lengkap"].(string); ok && name != "" {
-				userInfo.Name = name
-				log.Printf("   ✅ Found name from 'nama_lengkap': %s", name)
-			} else if name, ok := rawResponse["full_name"].(string); ok && name != "" {
-				userInfo.Name = name
-				log.Printf("   ✅ Found name from 'full_name': %s", name)
-			} else if name, ok := rawResponse["name"].(string); ok && name != "" {
-				userInfo.Name = name
-				log.Printf("   ✅ Found name from 'name': %s", name)
-			} else if name, ok := rawResponse["nama"].(string); ok && name != "" {
-				userInfo.Name = name
-				log.Printf("   ✅ Found name from 'nama': %s", name)
-			} else {
-				log.Printf("   ⚠️  Name not found in response. Available fields: %v", getMapKeys(rawResponse))
-			}
-		}
+// handleAuthCheck handles silent SSO check (redirects with prompt=none)
+func handleAuthCheck(w http.ResponseWriter, r *http.Request) {
+	// Use the shared helper which handles PKCE and state correctly
+	redirectToKeycloakLogin(w, r, true)
+}
 
-		// Parse Peran/Role dari berbagai field yang mungkin
-		if userInfo.Peran == "" && userInfo.Role == "" {
-			if peran, ok := rawResponse["peran"].(string); ok && peran != "" {
-				userInfo.Peran = peran
-				log.Printf("   ✅ Found peran from 'peran': %s", peran)
-			} else if role, ok := rawResponse["role"].(string); ok && role != "" {
-				userInfo.Peran = role
-				userInfo.Role = role
-				log.Printf("   ✅ Found peran from 'role': %s", role)
-			} else {
-				log.Printf("   ⚠️  Peran/Role not found in response. Available fields: %v", getMapKeys(rawResponse))
-			}
-		}
+// handleAuthValidate handles session validation for frontend script
+func handleAuthValidate(w http.ResponseWriter, r *http.Request) {
+	// Cek session lokal
+	sessionID, err := helpers.GetCookie(r, "client_dinas_session")
+	if err != nil || sessionID == "" {
+		// Session mati/tidak ada
+		w.WriteHeader(http.StatusUnauthorized)
+		return
 	}
 
-	// Gunakan Role jika Peran kosong
-	if userInfo.Peran == "" && userInfo.Role != "" {
-		userInfo.Peran = userInfo.Role
+	// Validasi session ID di database
+	_, ok, _ := validateSession(sessionID)
+	if !ok {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
 	}
 
-	// FALLBACK: Jika email masih tidak ditemukan, coba decode dari access token JWT
-	// Ini workaround untuk SSO server yang mengembalikan JWT claims bukan user info
-	if userInfo.Email == "" && userInfo.Sub != "" {
-		log.Printf("⚠️  Email tidak ditemukan di userinfo, mencoba decode dari access token...")
-
-		// Decode JWT token tanpa validasi (karena kita hanya perlu claims)
-		// Format JWT: header.payload.signature
-		parts := strings.Split(accessToken, ".")
-		if len(parts) == 3 {
-			// Decode payload (base64url)
-			payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
-			if err == nil {
-				var tokenClaims map[string]interface{}
-				if err := json.Unmarshal(payloadBytes, &tokenClaims); err == nil {
-					log.Printf("📋 JWT Token claims: %v", getMapKeys(tokenClaims))
-
-					// Coba ambil email dari token claims
-					if email, ok := tokenClaims["email"].(string); ok && email != "" {
-						userInfo.Email = email
-						log.Printf("   ✅ Found email from JWT token claims: %s", email)
-					}
-
-					// Coba ambil name dari token claims
-					if userInfo.Name == "" {
-						if name, ok := tokenClaims["name"].(string); ok && name != "" {
-							userInfo.Name = name
-							log.Printf("   ✅ Found name from JWT token claims: %s", name)
-						} else if name, ok := tokenClaims["nama_lengkap"].(string); ok && name != "" {
-							userInfo.Name = name
-							log.Printf("   ✅ Found name from JWT token claims (nama_lengkap): %s", name)
-						}
-					}
-
-					// Coba ambil peran dari token claims
-					if userInfo.Peran == "" {
-						if peran, ok := tokenClaims["peran"].(string); ok && peran != "" {
-							userInfo.Peran = peran
-							log.Printf("   ✅ Found peran from JWT token claims: %s", peran)
-						} else if role, ok := tokenClaims["role"].(string); ok && role != "" {
-							userInfo.Peran = role
-							log.Printf("   ✅ Found peran from JWT token claims (role): %s", role)
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// FALLBACK 2: Jika masih tidak ada email, coba ambil dari SSO server menggunakan sub
-	// Query SSO server untuk mendapatkan user info berdasarkan sub
-	if userInfo.Email == "" && userInfo.Sub != "" {
-		log.Printf("⚠️  Email masih tidak ditemukan, mencoba query SSO server dengan sub: %s", userInfo.Sub)
-
-		// Coba ambil user info dari SSO server menggunakan sub
-		// Endpoint mungkin berbeda, coba beberapa kemungkinan
-		userInfoEndpoints := []string{
-			fmt.Sprintf("%s/api/users/%s", config.SSOServerURL, userInfo.Sub),
-			fmt.Sprintf("%s/api/user/%s", config.SSOServerURL, userInfo.Sub),
-			fmt.Sprintf("%s/api/users?sub=%s", config.SSOServerURL, userInfo.Sub),
-		}
-
-		for _, endpoint := range userInfoEndpoints {
-			req, err := http.NewRequest("GET", endpoint, nil)
-			if err != nil {
-				continue
-			}
-			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
-
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				continue
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode == http.StatusOK {
-				bodyBytes, _ := io.ReadAll(resp.Body)
-				var userData map[string]interface{}
-				if err := json.Unmarshal(bodyBytes, &userData); err == nil {
-					if email, ok := userData["email"].(string); ok && email != "" {
-						userInfo.Email = email
-						log.Printf("   ✅ Found email from SSO server endpoint %s: %s", endpoint, email)
-						break
-					}
-				}
-			}
-		}
-	}
-
-	return &userInfo, nil
+	// Session valid
+	w.WriteHeader(http.StatusOK)
 }
 
 // findOrCreateUser mencari user di database atau membuat baru jika tidak ada
@@ -2471,6 +2637,11 @@ func SSOCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	tokenExpiresAt := time.Now().Unix() + int64(tokenExpiresIn)
 	helpers.SetCookie(w, r, "sso_token_expires", fmt.Sprintf("%d", tokenExpiresAt), tokenExpiresIn)
 
+	// Simpan ID Token (penting untuk logout dan user info display)
+	if tokenResponse.IDToken != "" {
+		helpers.SetCookie(w, r, "sso_id_token", tokenResponse.IDToken, tokenExpiresIn)
+	}
+
 	log.Printf("✅ Token saved: expires in %d seconds", tokenExpiresIn)
 
 	// Ambil user info dari SSO (WAJIB untuk membuat session)
@@ -2519,6 +2690,11 @@ func SSOCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	// SSO server menggunakan "sso_admin_session", client website menggunakan "client_dinas_session"
 	helpers.SetCookie(w, r, "client_dinas_session", sessionID, 86400) // 24 jam
 	log.Printf("✅ Cookie 'client_dinas_session' set: %s", sessionID)
+
+	// Set cookie untuk menandakan kapan terakhir kali check ke SSO dilakukan
+	// Ini digunakan untuk mencegah loop redirect ke /sso-check
+	helpers.SetCookie(w, r, "sso_check_time", fmt.Sprintf("%d", time.Now().Unix()), 3600) // Valid 1 jam
+	log.Printf("✅ Cookie 'sso_check_time' set")
 
 	// Log cookie settings untuk debugging
 	log.Printf("🔍 Cookie settings:")
@@ -2921,23 +3097,13 @@ func LogoutHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("✅ All auth cookies cleared, user logged out locally")
 
-	// Centralized Logout: Redirect ke Keycloak
-	keycloakBaseURL := getKeycloakBaseURL()
-	realm := getKeycloakRealm()
-	clientID := getKeycloakClientID()
-	// Redirect back to client login page after logout
-	postLogoutRedirectURI := "http://localhost:8070/login" 
+	// 4. Redirect ke Keycloak logout endpoint (Centralized Logout)
+	// Gunakan helper yang sudah diperbaiki (dengan prefix /sso-auth)
+	// Ambil ID Token dari cookie jika ada (untuk id_token_hint)
+	idToken, _ = helpers.GetCookie(r, "sso_id_token")
+	postLogoutRedirectURI := "http://localhost:8070/login"
 
-	logoutURL := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/logout?client_id=%s&post_logout_redirect_uri=%s",
-		keycloakBaseURL, realm, clientID, url.QueryEscape(postLogoutRedirectURI))
-
-	// Jika ada ID Token, tambahkan sebagai hint (dianjurkan oleh OIDC)
-	if idToken != "" {
-		logoutURL += fmt.Sprintf("&id_token_hint=%s", idToken)
-	}
-
-	log.Printf("👋 Redirecting to Keycloak logout: %s", logoutURL)
-	http.Redirect(w, r, logoutURL, http.StatusSeeOther)
+	redirectToKeycloakLogout(w, r, idToken, postLogoutRedirectURI)
 }
 
 // FrontChannelLogoutHandler menangani request logout DARI Keycloak (bukan dari user)
@@ -3169,7 +3335,7 @@ func handleSSOToken(r *http.Request, token string) bool {
 	}
 
 	// Get or create user and create session
-	sessionID, ok := createSessionFromEmail(r, email)
+	sessionID, ok := createSessionFromIdentifier(r, email)
 	if !ok {
 		return false
 	}
@@ -3185,14 +3351,14 @@ func handleSSOTokenSimple(r *http.Request, token string) bool {
 		// If successful, treat as email
 		email := string(decoded)
 		if helpers.ValidateEmail(email) {
-			sessionID, ok := createSessionFromEmail(r, email)
+			sessionID, ok := createSessionFromIdentifier(r, email)
 			return ok && sessionID != ""
 		}
 	}
 
 	// If not base64, try as direct email
 	if helpers.ValidateEmail(token) {
-		sessionID, ok := createSessionFromEmail(r, token)
+		sessionID, ok := createSessionFromIdentifier(r, token)
 		return ok && sessionID != ""
 	}
 
@@ -3252,20 +3418,26 @@ func handleSSOSession(r *http.Request, session string) bool {
 		return false
 	}
 
-	// Use email from SSO response
-	email := ssoResponse.Email
-	if email == "" && ssoResponse.User != nil {
+	// Use identifier (email or username) from SSO response
+	identifier := ssoResponse.Email
+	if identifier == "" && ssoResponse.User != nil {
 		if e, ok := ssoResponse.User["email"].(string); ok {
-			email = e
+			identifier = e
+		}
+		// Fallback to preferred_username if email is missing
+		if identifier == "" {
+			if u, ok := ssoResponse.User["preferred_username"].(string); ok {
+				identifier = u
+			}
 		}
 	}
 
-	if email == "" {
-		log.Println("ERROR: Email not found in SSO response")
+	if identifier == "" {
+		log.Println("ERROR: Identifier (email/username) not found in SSO response")
 		return false
 	}
 
-	sessionID, ok := createSessionFromEmail(r, email)
+	sessionID, ok := createSessionFromIdentifier(r, identifier)
 	return ok && sessionID != ""
 }
 
@@ -3291,7 +3463,7 @@ func checkSSOSessionWithCookie(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
-// createSessionFromEmail gets user from database and creates local session
+// createSessionFromIdentifier gets user from database and creates local session
 // getUserFromPostgreSQL looks up user from local PostgreSQL database
 // createSessionTableIfNotExists creates the sesi_login table if it doesn't exist
 func createSessionTableIfNotExists() error {
@@ -3330,31 +3502,45 @@ func createSessionTableIfNotExists() error {
 	return nil
 }
 
-func getUserFromPostgreSQL(email string) (map[string]interface{}, error) {
+func getUserFromPostgreSQL(identifier string) (map[string]interface{}, error) {
 	db, err := connectPostgreSQL()
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to PostgreSQL: %v", err)
 	}
 	defer db.Close()
 
-	// Query user from PostgreSQL
-	// Based on actual schema: id_pengguna, nama_pengguna, email, nama_lengkap, peran, password, aktif, created_at, updated_at
-	query := `SELECT id_pengguna, email, nama_lengkap, peran, aktif FROM pengguna WHERE email = $1 AND aktif = true`
+	// Query user from PostgreSQL (Schema Baru: account.za_users)
+	// Search by identifier in multiple columns
+	query := `
+		SELECT id, email, nickname, fullname, role_id, is_active 
+		FROM account.za_users 
+		WHERE (
+			email = $1 OR 
+			nickname = $1 OR 
+			nik = $1 OR 
+			nrk = $1 OR 
+			nikki = $1 OR 
+			npsn = $1 OR 
+			nisn = $1
+		) AND is_active = '1'
+	`
 
 	var user struct {
-		ID          string `json:"id_pengguna"`
-		Email       string `json:"email"`
-		NamaLengkap string `json:"nama_lengkap"`
-		Peran       string `json:"peran"`
-		Aktif       bool   `json:"aktif"`
+		ID          string         `json:"id"`
+		Email       sql.NullString `json:"email"`
+		Nickname    sql.NullString `json:"nickname"`
+		Fullname    sql.NullString `json:"fullname"`
+		RoleID      sql.NullString `json:"role_id"`
+		IsActive    string         `json:"is_active"` // char(1)
 	}
 
-	err = db.QueryRow(query, email).Scan(
+	err = db.QueryRow(query, identifier).Scan(
 		&user.ID,
 		&user.Email,
-		&user.NamaLengkap,
-		&user.Peran,
-		&user.Aktif,
+		&user.Nickname,
+		&user.Fullname,
+		&user.RoleID,
+		&user.IsActive,
 	)
 
 	if err != nil {
@@ -3365,37 +3551,48 @@ func getUserFromPostgreSQL(email string) (map[string]interface{}, error) {
 	}
 
 	// Convert to map[string]interface{} format for compatibility
+	// Map new schema columns to old keys expected by the app
 	userMap := map[string]interface{}{
-		"id_pengguna":  user.ID,
-		"email":        user.Email,
-		"nama_lengkap": user.NamaLengkap,
-		"peran":        user.Peran,
-		"aktif":        user.Aktif,
+		"id_pengguna":   user.ID,
+		"email":         user.Email.String,
+		"nama_pengguna": user.Nickname.String,
+		"nama_lengkap":  user.Fullname.String, // Pastikan ini terisi dari DB
+		"peran":         user.RoleID.String,   // Pastikan ini terisi dari DB
+		"aktif":         user.IsActive == "1",
+	}
+
+	// Fallback jika nama_lengkap kosong, gunakan nickname
+	if userMap["nama_lengkap"] == "" {
+		userMap["nama_lengkap"] = userMap["nama_pengguna"]
+	}
+	// Fallback jika peran kosong, set default user
+	if userMap["peran"] == "" {
+		userMap["peran"] = "user"
 	}
 
 	return userMap, nil
 }
 
 // ensureUserInSupabase creates user in Supabase if not exists (for session foreign key)
-func createSessionFromEmail(r *http.Request, email string) (string, bool) {
-	log.Printf("🔄 Creating session for email: %s", email)
+func createSessionFromIdentifier(r *http.Request, identifier string) (string, bool) {
+	log.Printf("🔄 Creating session for identifier: %s", identifier)
 
 	// Get user from PostgreSQL database
-	log.Printf("🔍 Checking PostgreSQL database for user: %s", email)
-	pgUser, err := getUserFromPostgreSQL(email)
+	log.Printf("🔍 Checking PostgreSQL database for user: %s", identifier)
+	pgUser, err := getUserFromPostgreSQL(identifier)
 	if err != nil {
 		log.Printf("❌ User not found in PostgreSQL: %v", err)
-		log.Printf("❌ User with email %s not found in database", email)
+		log.Printf("❌ User with identifier %s not found in database", identifier)
 		return "", false
 	}
 
 	user := pgUser
-	log.Printf("✅ User found in PostgreSQL database: %s", email)
+	log.Printf("✅ User found in PostgreSQL database: %s (Email: %s)", identifier, user["email"])
 	log.Printf("📋 User found in PostgreSQL - Name: %v, Role: %v", user["nama_lengkap"], user["peran"])
 
 	// Check if user is active
 	if active, ok := user["aktif"].(bool); !ok || !active {
-		log.Printf("WARNING: User %s is not active", email)
+		log.Printf("WARNING: User %s is not active", identifier)
 		return "", false
 	}
 
@@ -3405,38 +3602,7 @@ func createSessionFromEmail(r *http.Request, email string) (string, bool) {
 		log.Printf("ERROR generating session ID: %v", err)
 		return "", false
 	}
-
-	expiresAt := time.Now().Add(24 * time.Hour)
-	// Schema Supabase: id_pengguna, id_sesi, ip, user_agent, kadaluarsa
-	// Schema: id_pengguna adalah primary key, bukan id
-	userIDValue := user["id_pengguna"]
-	if userIDValue == nil {
-		userIDValue = user["id"]
-	}
-	sessionData := map[string]interface{}{
-		"id_pengguna": userIDValue,                    // user_id → id_pengguna
-		"id_sesi":     sessionID,                      // session_id → id_sesi
-		"ip":          getIPAddress(r),                // ip_address → ip
-		"user_agent":  r.UserAgent(),                  // user_agent (sudah benar)
-		"kadaluarsa":  expiresAt.Format(time.RFC3339), // expires_at → kadaluarsa
-	}
-
-	// Ensure session table exists
-	err = createSessionTableIfNotExists()
-	if err != nil {
-		log.Printf("ERROR ensuring session table: %v", err)
-		return "", false
-	}
-
-	// Create session in PostgreSQL database
-	log.Printf("🔄 Creating session in PostgreSQL database...")
-
-	userID := user["id_pengguna"].(string)
-	ip := sessionData["ip"].(string)
-	userAgent := sessionData["user_agent"].(string)
-	// expiresAt already defined above
-
-	// Insert session into PostgreSQL
+	// Connect to PostgreSQL
 	db, err := connectPostgreSQL()
 	if err != nil {
 		log.Printf("ERROR connecting to PostgreSQL: %v", err)
@@ -3444,6 +3610,18 @@ func createSessionFromEmail(r *http.Request, email string) (string, bool) {
 	}
 	defer db.Close()
 
+	// Ensure session table exists
+	if err := createSessionTableIfNotExists(); err != nil {
+		log.Printf("ERROR ensuring session table: %v", err)
+		return "", false
+	}
+
+	expiresAt := time.Now().Add(24 * time.Hour)
+	ip := getIPAddress(r)
+	userAgent := r.UserAgent()
+	userID := user["id_pengguna"] // Gunakan ID dari map yang sudah distandarisasi
+
+	// Insert session into PostgreSQL
 	insertQuery := `
 		INSERT INTO sesi_login (id_pengguna, id_sesi, ip, user_agent, kadaluarsa, created_at) 
 		VALUES ($1, $2, $3, $4, $5, NOW())
@@ -3455,7 +3633,7 @@ func createSessionFromEmail(r *http.Request, email string) (string, bool) {
 		return "", false
 	}
 
-	log.Printf("✅ Session created successfully in PostgreSQL for user: %s", user["email"])
+	log.Printf("✅ Session created successfully in PostgreSQL for user: %s (ID: %v)", user["nama_lengkap"], userID)
 
 	// Return session ID for cookie setting
 	return sessionID, true
@@ -3603,7 +3781,7 @@ func handleSSOTokenWithCookie(w http.ResponseWriter, r *http.Request, token stri
 
 	// Get or create user and create session
 	log.Printf("🔄 Creating session for email: %s", email)
-	sessionID, ok := createSessionFromEmail(r, email)
+	sessionID, ok := createSessionFromIdentifier(r, email)
 	if !ok {
 		log.Printf("❌ Failed to create session for email: %s", email)
 		return false
@@ -3626,7 +3804,7 @@ func handleSSOTokenSimpleWithCookie(w http.ResponseWriter, r *http.Request, toke
 		// If successful, treat as email
 		email := string(decoded)
 		if helpers.ValidateEmail(email) {
-			sessionID, ok := createSessionFromEmail(r, email)
+			sessionID, ok := createSessionFromIdentifier(r, email)
 			if ok {
 				helpers.SetCookie(w, r, "session_id", sessionID, 86400)
 				return true
@@ -3636,7 +3814,7 @@ func handleSSOTokenSimpleWithCookie(w http.ResponseWriter, r *http.Request, toke
 
 	// If not base64, try as direct email
 	if helpers.ValidateEmail(token) {
-		sessionID, ok := createSessionFromEmail(r, token)
+		sessionID, ok := createSessionFromIdentifier(r, token)
 		if ok {
 			helpers.SetCookie(w, r, "session_id", sessionID, 86400)
 			return true
@@ -3699,20 +3877,26 @@ func handleSSOSessionWithCookie(w http.ResponseWriter, r *http.Request, session 
 		return false
 	}
 
-	// Use email from SSO response
-	email := ssoResponse.Email
-	if email == "" && ssoResponse.User != nil {
+	// Use identifier (email or username) from SSO response
+	identifier := ssoResponse.Email
+	if identifier == "" && ssoResponse.User != nil {
 		if e, ok := ssoResponse.User["email"].(string); ok {
-			email = e
+			identifier = e
+		}
+		// Fallback to preferred_username if email is missing
+		if identifier == "" {
+			if u, ok := ssoResponse.User["preferred_username"].(string); ok {
+				identifier = u
+			}
 		}
 	}
 
-	if email == "" {
-		log.Println("ERROR: Email not found in SSO response")
+	if identifier == "" {
+		log.Println("ERROR: Identifier (email/username) not found in SSO response")
 		return false
 	}
 
-	sessionID, ok := createSessionFromEmail(r, email)
+	sessionID, ok := createSessionFromIdentifier(r, identifier)
 	if !ok {
 		return false
 	}
