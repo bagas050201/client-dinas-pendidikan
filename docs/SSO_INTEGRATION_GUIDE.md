@@ -1,106 +1,151 @@
-# 🔐 Panduan Integrasi SSO Keycloak untuk Client
+# 🔐 Panduan Integrasi SSO Keycloak
 
-Panduan lengkap untuk mengintegrasikan Single Sign-On (SSO) Keycloak ke dalam website client Anda.
+Panduan **copy-paste ready** untuk mengintegrasikan Single Sign-On (SSO) Keycloak ke website client Anda.
+
+---
 
 ## Daftar Isi
 
-1. [Arsitektur SSO](#arsitektur-sso)
-2. [Prasyarat](#prasyarat)
-3. [Konfigurasi Environment](#konfigurasi-environment)
-4. [Flow Autentikasi](#flow-autentikasi)
-5. [Implementasi Go](#implementasi-go)
-6. [Implementasi JavaScript](#implementasi-javascript)
-7. [Implementasi Laravel (PHP)](#implementasi-laravel-php)
-8. [Implementasi Python (Flask)](#implementasi-python-flask)
-9. [Implementasi Node.js](#implementasi-nodejs)
-10. [Session Management](#session-management)
-11. [Logout & Token Revocation](#logout--token-revocation)
-12. [Troubleshooting](#troubleshooting)
+1. [Quickstart (5 Menit)](#quickstart-5-menit)
+2. [Konsep SSO](#konsep-sso)
+3. [Environment Variables](#environment-variables)
+4. [Implementasi Go (Golang)](#implementasi-go-golang)
+5. [Implementasi JavaScript (Browser)](#implementasi-javascript-browser)
+6. [Implementasi PHP (Laravel)](#implementasi-php-laravel)
+7. [Implementasi Python (Flask)](#implementasi-python-flask)
+8. [Implementasi Node.js (Express)](#implementasi-nodejs-express)
+9. [Session Management](#session-management)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
-## Arsitektur SSO
+## Quickstart (5 Menit)
+
+### Langkah 1: Daftarkan Client di Keycloak
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   User Browser  │────▶│  Client App     │────▶│    Keycloak     │
-│                 │     │  (Website Anda) │     │   SSO Server    │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-        │                       │                       │
-        │  1. Klik Login        │                       │
-        │──────────────────────▶│                       │
-        │                       │  2. Redirect ke SSO   │
-        │                       │──────────────────────▶│
-        │                       │                       │
-        │  3. Login di Keycloak │                       │
-        │──────────────────────────────────────────────▶│
-        │                       │                       │
-        │  4. Callback + Code   │                       │
-        │◀──────────────────────────────────────────────│
-        │                       │  5. Exchange Code     │
-        │                       │──────────────────────▶│
-        │                       │  6. Access Token      │
-        │                       │◀──────────────────────│
-        │  7. Session Created   │                       │
-        │◀──────────────────────│                       │
-```
-
----
-
-## Prasyarat
-
-1. **Keycloak Server** yang sudah dikonfigurasi
-2. **Client terdaftar** di Keycloak realm
-3. **Environment variables** yang benar
-
-### Konfigurasi Client di Keycloak
-
 1. Buka Keycloak Admin Console
-2. Pilih Realm → Clients → Create Client
-3. Setting:
-   - **Client ID**: `your-client-id`
-   - **Client Protocol**: `openid-connect`
-   - **Access Type**: `public` (untuk flow PKCE) atau `confidential`
-   - **Valid Redirect URIs**: `http://localhost:8070/sso/callback`
-   - **Web Origins**: `http://localhost:8070`
+2. Clients → Create Client
+3. Isi:
+   - Client ID: your-app-client
+   - Client Protocol: openid-connect
+   - Access Type: public (untuk PKCE)
+4. Settings:
+   - Valid Redirect URIs: http://localhost:YOUR_PORT/callback
+   - Web Origins: http://localhost:YOUR_PORT
+```
 
----
+### Langkah 2: Set Environment Variables
 
-## Konfigurasi Environment
+```bash
+KEYCLOAK_BASE_URL=http://localhost:8080
+KEYCLOAK_REALM=dinas-pendidikan
+KEYCLOAK_CLIENT_ID=your-app-client
+KEYCLOAK_REDIRECT_URI=http://localhost:YOUR_PORT/callback
+```
 
-```env
-# SSO Keycloak Configuration
-SSO_URL=http://localhost:8080              # URL Keycloak Server
-SSO_REALM=dinas-pendidikan                 # Nama Realm
-SSO_CLIENT_ID=client-dinas                 # Client ID
-SSO_CLIENT_SECRET=your-secret              # Secret (jika confidential)
-SSO_REDIRECT_URI=http://localhost:8070/sso/callback
+### Langkah 3: Implementasi Minimal
 
-# Server Configuration
-PORT=8070
+**Go:**
+```go
+// Login
+http.Redirect(w, r, getKeycloakAuthURL(), http.StatusFound)
+
+// Callback
+token := exchangeCode(r.URL.Query().Get("code"))
+userInfo := parseIDToken(token.IDToken)
 ```
 
 ---
 
-## Flow Autentikasi
+## Konsep SSO
 
-### 1. Authorization Code Flow dengan PKCE (Recommended)
+### Flow Diagram
 
 ```
-1. User klik "Login dengan SSO"
-2. Generate code_verifier dan code_challenge (PKCE)
-3. Redirect ke Keycloak Authorization Endpoint
-4. User login di Keycloak
-5. Keycloak redirect ke callback URL dengan authorization code
-6. Exchange code + code_verifier untuk access token
-7. Validasi token dan buat session lokal
+┌──────────────────────────────────────────────────────────────────┐
+│                         FLOW SSO KEYCLOAK                        │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   [1] User klik "Login"                                          │
+│         │                                                        │
+│         ▼                                                        │
+│   [2] Redirect ke Keycloak                                       │
+│       URL: /realms/{realm}/protocol/openid-connect/auth          │
+│       + client_id                                                │
+│       + redirect_uri                                             │
+│       + code_challenge (PKCE)                                    │
+│       + state (CSRF protection)                                  │
+│         │                                                        │
+│         ▼                                                        │
+│   [3] User login di Keycloak                                     │
+│         │                                                        │
+│         ▼                                                        │
+│   [4] Keycloak redirect ke callback URL                          │
+│       + code (authorization code)                                │
+│       + state                                                    │
+│         │                                                        │
+│         ▼                                                        │
+│   [5] Website kirim POST ke token endpoint                       │
+│       /realms/{realm}/protocol/openid-connect/token              │
+│       + code                                                     │
+│       + code_verifier (PKCE)                                     │
+│         │                                                        │
+│         ▼                                                        │
+│   [6] Keycloak return access_token + id_token                    │
+│         │                                                        │
+│         ▼                                                        │
+│   [7] Parse id_token → dapat user info                           │
+│         │                                                        │
+│         ▼                                                        │
+│   [8] Buat session lokal → redirect ke dashboard                 │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Apa itu PKCE?
+
+**PKCE (Proof Key for Code Exchange)** adalah mekanisme keamanan untuk mencegah authorization code interception.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                        PKCE FLOW                        │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  1. Generate random string → code_verifier              │
+│                                                         │
+│  2. Hash dengan SHA256 → code_challenge                 │
+│     code_challenge = BASE64URL(SHA256(code_verifier))   │
+│                                                         │
+│  3. Kirim code_challenge ke Keycloak (saat login)       │
+│                                                         │
+│  4. Kirim code_verifier ke Keycloak (saat token)        │
+│                                                         │
+│  5. Keycloak verify: SHA256(verifier) == challenge      │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Implementasi Go
+## Environment Variables
 
-### File: `pkg/sso/keycloak.go`
+```bash
+# Wajib
+KEYCLOAK_BASE_URL=http://localhost:8080     # URL Keycloak Server
+KEYCLOAK_REALM=dinas-pendidikan             # Nama Realm
+KEYCLOAK_CLIENT_ID=your-app-client          # Client ID
+KEYCLOAK_REDIRECT_URI=http://localhost:8070/callback  # Callback URL
+
+# Opsional (untuk confidential client)
+KEYCLOAK_CLIENT_SECRET=your-secret
+```
+
+---
+
+## Implementasi Go (Golang)
+
+### File Lengkap: `sso/keycloak.go`
 
 ```go
 package sso
@@ -116,323 +161,247 @@ import (
     "net/url"
     "os"
     "strings"
-    "time"
 )
 
-// TokenResponse dari Keycloak
-type TokenResponse struct {
-    AccessToken  string `json:"access_token"`
-    TokenType    string `json:"token_type"`
-    ExpiresIn    int    `json:"expires_in"`
-    RefreshToken string `json:"refresh_token"`
-    IDToken      string `json:"id_token"`
+// ==================== KONFIGURASI ====================
+
+type Config struct {
+    BaseURL     string
+    Realm       string
+    ClientID    string
+    RedirectURI string
 }
 
-// UserInfo dari Keycloak
-type UserInfo struct {
-    Sub               string `json:"sub"`
-    Email             string `json:"email"`
-    EmailVerified     bool   `json:"email_verified"`
-    Name              string `json:"name"`
-    PreferredUsername string `json:"preferred_username"`
+func GetConfig() Config {
+    return Config{
+        BaseURL:     os.Getenv("KEYCLOAK_BASE_URL"),
+        Realm:       os.Getenv("KEYCLOAK_REALM"),
+        ClientID:    os.Getenv("KEYCLOAK_CLIENT_ID"),
+        RedirectURI: os.Getenv("KEYCLOAK_REDIRECT_URI"),
+    }
 }
 
-// GeneratePKCE membuat code_verifier dan code_challenge
-func GeneratePKCE() (verifier string, challenge string, err error) {
-    // Generate random bytes untuk code_verifier
+// ==================== PKCE ====================
+
+type PKCE struct {
+    Verifier  string
+    Challenge string
+}
+
+func GeneratePKCE() (*PKCE, error) {
+    // Generate random 32 bytes
     b := make([]byte, 32)
     if _, err := rand.Read(b); err != nil {
-        return "", "", err
+        return nil, err
     }
-    verifier = base64.RawURLEncoding.EncodeToString(b)
     
-    // Generate code_challenge (SHA256 hash dari verifier)
-    h := sha256.Sum256([]byte(verifier))
-    challenge = base64.RawURLEncoding.EncodeToString(h[:])
+    verifier := base64.RawURLEncoding.EncodeToString(b)
+    hash := sha256.Sum256([]byte(verifier))
+    challenge := base64.RawURLEncoding.EncodeToString(hash[:])
     
-    return verifier, challenge, nil
+    return &PKCE{Verifier: verifier, Challenge: challenge}, nil
 }
 
-// GetAuthorizationURL membuat URL untuk redirect ke Keycloak
-func GetAuthorizationURL(state, codeChallenge string) string {
-    ssoURL := os.Getenv("SSO_URL")
-    realm := os.Getenv("SSO_REALM")
-    clientID := os.Getenv("SSO_CLIENT_ID")
-    redirectURI := os.Getenv("SSO_REDIRECT_URI")
+// ==================== AUTH URL ====================
+
+func GetAuthURL(state, codeChallenge string) string {
+    cfg := GetConfig()
     
-    params := url.Values{}
-    params.Set("client_id", clientID)
-    params.Set("redirect_uri", redirectURI)
-    params.Set("response_type", "code")
-    params.Set("scope", "openid email profile")
-    params.Set("state", state)
-    params.Set("code_challenge", codeChallenge)
-    params.Set("code_challenge_method", "S256")
+    params := url.Values{
+        "client_id":             {cfg.ClientID},
+        "redirect_uri":          {cfg.RedirectURI},
+        "response_type":         {"code"},
+        "scope":                 {"openid email profile"},
+        "state":                 {state},
+        "code_challenge":        {codeChallenge},
+        "code_challenge_method": {"S256"},
+    }
     
     return fmt.Sprintf("%s/realms/%s/protocol/openid-connect/auth?%s",
-        ssoURL, realm, params.Encode())
+        cfg.BaseURL, cfg.Realm, params.Encode())
 }
 
-// ExchangeCodeForToken menukar authorization code dengan access token
-func ExchangeCodeForToken(code, codeVerifier string) (*TokenResponse, error) {
-    ssoURL := os.Getenv("SSO_URL")
-    realm := os.Getenv("SSO_REALM")
-    clientID := os.Getenv("SSO_CLIENT_ID")
-    clientSecret := os.Getenv("SSO_CLIENT_SECRET")
-    redirectURI := os.Getenv("SSO_REDIRECT_URI")
+// ==================== TOKEN EXCHANGE ====================
+
+type TokenResponse struct {
+    AccessToken  string `json:"access_token"`
+    IDToken      string `json:"id_token"`
+    RefreshToken string `json:"refresh_token"`
+    ExpiresIn    int    `json:"expires_in"`
+}
+
+func ExchangeCode(code, codeVerifier string) (*TokenResponse, error) {
+    cfg := GetConfig()
     
     tokenURL := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/token",
-        ssoURL, realm)
+        cfg.BaseURL, cfg.Realm)
     
-    data := url.Values{}
-    data.Set("grant_type", "authorization_code")
-    data.Set("client_id", clientID)
-    data.Set("code", code)
-    data.Set("redirect_uri", redirectURI)
-    data.Set("code_verifier", codeVerifier)
-    
-    // Tambahkan client_secret jika confidential client
-    if clientSecret != "" {
-        data.Set("client_secret", clientSecret)
+    data := url.Values{
+        "grant_type":    {"authorization_code"},
+        "client_id":     {cfg.ClientID},
+        "code":          {code},
+        "redirect_uri":  {cfg.RedirectURI},
+        "code_verifier": {codeVerifier},
     }
     
     resp, err := http.PostForm(tokenURL, data)
     if err != nil {
-        return nil, fmt.Errorf("failed to exchange code: %v", err)
+        return nil, err
     }
     defer resp.Body.Close()
     
-    if resp.StatusCode != http.StatusOK {
+    if resp.StatusCode != 200 {
         body, _ := io.ReadAll(resp.Body)
-        return nil, fmt.Errorf("token exchange failed: %s", string(body))
+        return nil, fmt.Errorf("token error: %s", string(body))
     }
     
-    var tokenResp TokenResponse
-    if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-        return nil, err
-    }
-    
-    return &tokenResp, nil
+    var token TokenResponse
+    json.NewDecoder(resp.Body).Decode(&token)
+    return &token, nil
 }
 
-// GetUserInfo mengambil informasi user dari Keycloak
-func GetUserInfo(accessToken string) (*UserInfo, error) {
-    ssoURL := os.Getenv("SSO_URL")
-    realm := os.Getenv("SSO_REALM")
-    
-    userInfoURL := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/userinfo",
-        ssoURL, realm)
-    
-    req, _ := http.NewRequest("GET", userInfoURL, nil)
-    req.Header.Set("Authorization", "Bearer "+accessToken)
-    
-    client := &http.Client{Timeout: 10 * time.Second}
-    resp, err := client.Do(req)
-    if err != nil {
-        return nil, err
-    }
-    defer resp.Body.Close()
-    
-    if resp.StatusCode != http.StatusOK {
-        return nil, fmt.Errorf("userinfo request failed: %d", resp.StatusCode)
-    }
-    
-    var userInfo UserInfo
-    if err := json.NewDecoder(resp.Body).Decode(&userInfo); err != nil {
-        return nil, err
-    }
-    
-    return &userInfo, nil
+// ==================== PARSE ID TOKEN ====================
+
+type UserInfo struct {
+    Sub      string `json:"sub"`
+    Email    string `json:"email"`
+    Name     string `json:"name"`
+    Username string `json:"preferred_username"`
 }
 
-// ValidateSession memeriksa apakah session SSO masih valid
-func ValidateSession(accessToken string) bool {
-    userInfo, err := GetUserInfo(accessToken)
-    return err == nil && userInfo != nil
-}
-
-// Logout dari Keycloak
-func Logout(idToken, redirectURI string) string {
-    ssoURL := os.Getenv("SSO_URL")
-    realm := os.Getenv("SSO_REALM")
-    
-    params := url.Values{}
-    params.Set("id_token_hint", idToken)
-    params.Set("post_logout_redirect_uri", redirectURI)
-    
-    return fmt.Sprintf("%s/realms/%s/protocol/openid-connect/logout?%s",
-        ssoURL, realm, params.Encode())
-}
-
-// ParseIDToken mengambil claims dari ID Token (tanpa validasi signature)
-func ParseIDToken(idToken string) (map[string]interface{}, error) {
+func ParseIDToken(idToken string) (*UserInfo, error) {
     parts := strings.Split(idToken, ".")
     if len(parts) != 3 {
-        return nil, fmt.Errorf("invalid token format")
+        return nil, fmt.Errorf("invalid token")
     }
     
-    // Decode payload (bagian kedua)
-    payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+    // Decode payload
+    payload := parts[1]
+    if len(payload)%4 != 0 {
+        payload += strings.Repeat("=", 4-len(payload)%4)
+    }
+    
+    decoded, err := base64.URLEncoding.DecodeString(payload)
     if err != nil {
         return nil, err
     }
     
-    var claims map[string]interface{}
-    if err := json.Unmarshal(payload, &claims); err != nil {
-        return nil, err
+    var user UserInfo
+    json.Unmarshal(decoded, &user)
+    return &user, nil
+}
+
+// ==================== LOGOUT URL ====================
+
+func GetLogoutURL(idToken, postLogoutURI string) string {
+    cfg := GetConfig()
+    
+    params := url.Values{
+        "client_id":                {cfg.ClientID},
+        "post_logout_redirect_uri": {postLogoutURI},
+        "id_token_hint":            {idToken},
     }
     
-    return claims, nil
+    return fmt.Sprintf("%s/realms/%s/protocol/openid-connect/logout?%s",
+        cfg.BaseURL, cfg.Realm, params.Encode())
 }
 ```
 
-### File: `handlers/sso_handler.go`
+### Contoh Handler: `handlers/auth.go`
 
 ```go
 package handlers
 
 import (
-    "log"
     "net/http"
-    "your-app/pkg/sso"
+    "your-app/sso"
 )
 
-// SSOLoginHandler memulai flow SSO
-func SSOLoginHandler(w http.ResponseWriter, r *http.Request) {
-    // Generate PKCE
-    verifier, challenge, err := sso.GeneratePKCE()
-    if err != nil {
-        http.Error(w, "Failed to generate PKCE", http.StatusInternalServerError)
-        return
-    }
+// LoginHandler - Mulai SSO flow
+func LoginHandler(w http.ResponseWriter, r *http.Request) {
+    // 1. Generate PKCE
+    pkce, _ := sso.GeneratePKCE()
     
-    // Generate state (untuk CSRF protection)
+    // 2. Generate state
     state := generateRandomString(32)
     
-    // Simpan verifier dan state di cookie/session
-    http.SetCookie(w, &http.Cookie{
-        Name:     "pkce_verifier",
-        Value:    verifier,
-        Path:     "/",
-        HttpOnly: true,
-        MaxAge:   300, // 5 menit
-    })
-    http.SetCookie(w, &http.Cookie{
-        Name:     "oauth_state",
-        Value:    state,
-        Path:     "/",
-        HttpOnly: true,
-        MaxAge:   300,
-    })
+    // 3. Simpan di cookie
+    http.SetCookie(w, &http.Cookie{Name: "pkce_verifier", Value: pkce.Verifier, MaxAge: 300})
+    http.SetCookie(w, &http.Cookie{Name: "oauth_state", Value: state, MaxAge: 300})
     
-    // Redirect ke Keycloak
-    authURL := sso.GetAuthorizationURL(state, challenge)
+    // 4. Redirect ke Keycloak
+    authURL := sso.GetAuthURL(state, pkce.Challenge)
     http.Redirect(w, r, authURL, http.StatusFound)
 }
 
-// SSOCallbackHandler menangani callback dari Keycloak
-func SSOCallbackHandler(w http.ResponseWriter, r *http.Request) {
-    // Ambil authorization code
+// CallbackHandler - Handle callback dari Keycloak
+func CallbackHandler(w http.ResponseWriter, r *http.Request) {
+    // 1. Validasi state
+    stateCookie, _ := r.Cookie("oauth_state")
+    if r.URL.Query().Get("state") != stateCookie.Value {
+        http.Error(w, "Invalid state", 400)
+        return
+    }
+    
+    // 2. Ambil code
     code := r.URL.Query().Get("code")
-    state := r.URL.Query().Get("state")
     
-    // Validasi state
-    stateCookie, err := r.Cookie("oauth_state")
-    if err != nil || stateCookie.Value != state {
-        http.Error(w, "Invalid state", http.StatusBadRequest)
-        return
-    }
+    // 3. Ambil verifier
+    verifierCookie, _ := r.Cookie("pkce_verifier")
     
-    // Ambil code_verifier
-    verifierCookie, err := r.Cookie("pkce_verifier")
+    // 4. Exchange code
+    token, err := sso.ExchangeCode(code, verifierCookie.Value)
     if err != nil {
-        http.Error(w, "Missing PKCE verifier", http.StatusBadRequest)
+        http.Error(w, err.Error(), 500)
         return
     }
     
-    // Exchange code untuk token
-    tokenResp, err := sso.ExchangeCodeForToken(code, verifierCookie.Value)
-    if err != nil {
-        log.Printf("Token exchange error: %v", err)
-        http.Error(w, "Failed to get token", http.StatusInternalServerError)
-        return
-    }
+    // 5. Parse user info
+    user, _ := sso.ParseIDToken(token.IDToken)
     
-    // Ambil user info
-    userInfo, err := sso.GetUserInfo(tokenResp.AccessToken)
-    if err != nil {
-        log.Printf("UserInfo error: %v", err)
-        http.Error(w, "Failed to get user info", http.StatusInternalServerError)
-        return
-    }
+    // 6. Buat session (implementasi Anda)
+    sessionID := createSession(user.Email)
     
-    // Simpan token di cookie
-    http.SetCookie(w, &http.Cookie{
-        Name:     "sso_access_token",
-        Value:    tokenResp.AccessToken,
-        Path:     "/",
-        HttpOnly: true,
-        MaxAge:   tokenResp.ExpiresIn,
-    })
-    http.SetCookie(w, &http.Cookie{
-        Name:     "sso_id_token",
-        Value:    tokenResp.IDToken,
-        Path:     "/",
-        HttpOnly: true,
-        MaxAge:   tokenResp.ExpiresIn,
-    })
+    // 7. Set cookies
+    http.SetCookie(w, &http.Cookie{Name: "session_id", Value: sessionID, MaxAge: 86400})
+    http.SetCookie(w, &http.Cookie{Name: "id_token", Value: token.IDToken, MaxAge: 86400})
     
-    // Buat session lokal
-    sessionID := createSession(userInfo.Email)
-    http.SetCookie(w, &http.Cookie{
-        Name:     "session_id",
-        Value:    sessionID,
-        Path:     "/",
-        HttpOnly: true,
-        MaxAge:   86400, // 24 jam
-    })
+    // 8. Clear PKCE cookies
+    http.SetCookie(w, &http.Cookie{Name: "pkce_verifier", MaxAge: -1})
+    http.SetCookie(w, &http.Cookie{Name: "oauth_state", MaxAge: -1})
     
-    // Clear PKCE cookies
-    http.SetCookie(w, &http.Cookie{Name: "pkce_verifier", MaxAge: -1, Path: "/"})
-    http.SetCookie(w, &http.Cookie{Name: "oauth_state", MaxAge: -1, Path: "/"})
-    
-    // Redirect ke dashboard
+    // 9. Redirect ke dashboard
     http.Redirect(w, r, "/dashboard", http.StatusFound)
 }
 
-// SSOLogoutHandler menangani logout
-func SSOLogoutHandler(w http.ResponseWriter, r *http.Request) {
-    // Ambil ID token untuk logout hint
-    idTokenCookie, _ := r.Cookie("sso_id_token")
-    idToken := ""
-    if idTokenCookie != nil {
-        idToken = idTokenCookie.Value
-    }
+// LogoutHandler - Logout dari SSO
+func LogoutHandler(w http.ResponseWriter, r *http.Request) {
+    // 1. Ambil ID token
+    idTokenCookie, _ := r.Cookie("id_token")
     
-    // Clear semua cookies
-    http.SetCookie(w, &http.Cookie{Name: "session_id", MaxAge: -1, Path: "/"})
-    http.SetCookie(w, &http.Cookie{Name: "sso_access_token", MaxAge: -1, Path: "/"})
-    http.SetCookie(w, &http.Cookie{Name: "sso_id_token", MaxAge: -1, Path: "/"})
+    // 2. Clear session
+    http.SetCookie(w, &http.Cookie{Name: "session_id", MaxAge: -1})
+    http.SetCookie(w, &http.Cookie{Name: "id_token", MaxAge: -1})
     
-    // Redirect ke Keycloak logout
-    logoutURL := sso.Logout(idToken, "http://localhost:8070/login")
+    // 3. Redirect ke Keycloak logout
+    logoutURL := sso.GetLogoutURL(idTokenCookie.Value, "http://localhost:8070/login")
     http.Redirect(w, r, logoutURL, http.StatusFound)
 }
 ```
 
 ---
 
-## Implementasi JavaScript
+## Implementasi JavaScript (Browser)
 
 ### File: `sso-client.js`
 
 ```javascript
 class SSOClient {
     constructor(config) {
-        this.ssoUrl = config.ssoUrl;
-        this.realm = config.realm;
-        this.clientId = config.clientId;
-        this.redirectUri = config.redirectUri;
+        this.baseURL = config.baseURL;       // 'http://localhost:8080'
+        this.realm = config.realm;           // 'dinas-pendidikan'
+        this.clientId = config.clientId;     // 'your-app-client'
+        this.redirectUri = config.redirectUri; // 'http://localhost:3000/callback'
     }
     
     // Generate PKCE
@@ -456,10 +425,10 @@ class SSOClient {
             .replace(/=/g, '');
     }
     
-    // Mulai login flow
+    // Mulai login
     async login() {
         const { verifier, challenge } = await this.generatePKCE();
-        const state = this.generateState();
+        const state = this.base64UrlEncode(crypto.getRandomValues(new Uint8Array(16)));
         
         // Simpan di sessionStorage
         sessionStorage.setItem('pkce_verifier', verifier);
@@ -475,8 +444,7 @@ class SSOClient {
             code_challenge_method: 'S256'
         });
         
-        window.location.href = 
-            `${this.ssoUrl}/realms/${this.realm}/protocol/openid-connect/auth?${params}`;
+        window.location.href = `${this.baseURL}/realms/${this.realm}/protocol/openid-connect/auth?${params}`;
     }
     
     // Handle callback
@@ -486,83 +454,76 @@ class SSOClient {
         const state = params.get('state');
         
         // Validasi state
-        const savedState = sessionStorage.getItem('oauth_state');
-        if (state !== savedState) {
+        if (state !== sessionStorage.getItem('oauth_state')) {
             throw new Error('Invalid state');
         }
         
         const verifier = sessionStorage.getItem('pkce_verifier');
         
-        // Exchange code for token
-        const tokenResponse = await this.exchangeCode(code, verifier);
+        // Exchange code untuk token
+        const response = await fetch(`${this.baseURL}/realms/${this.realm}/protocol/openid-connect/token`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                grant_type: 'authorization_code',
+                client_id: this.clientId,
+                code: code,
+                redirect_uri: this.redirectUri,
+                code_verifier: verifier
+            })
+        });
         
-        // Clear PKCE data
+        if (!response.ok) throw new Error('Token exchange failed');
+        
+        const tokens = await response.json();
+        
+        // Clear PKCE
         sessionStorage.removeItem('pkce_verifier');
         sessionStorage.removeItem('oauth_state');
         
-        return tokenResponse;
+        // Parse user info dari ID token
+        const user = this.parseJwt(tokens.id_token);
+        
+        return { tokens, user };
     }
     
-    async exchangeCode(code, verifier) {
-        const response = await fetch(
-            `${this.ssoUrl}/realms/${this.realm}/protocol/openid-connect/token`,
-            {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded'
-                },
-                body: new URLSearchParams({
-                    grant_type: 'authorization_code',
-                    client_id: this.clientId,
-                    code: code,
-                    redirect_uri: this.redirectUri,
-                    code_verifier: verifier
-                })
-            }
-        );
-        
-        if (!response.ok) {
-            throw new Error('Token exchange failed');
-        }
-        
-        return response.json();
+    // Parse JWT
+    parseJwt(token) {
+        const payload = token.split('.')[1];
+        return JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/')));
     }
     
     // Logout
     logout(idToken) {
         const params = new URLSearchParams({
-            id_token_hint: idToken,
-            post_logout_redirect_uri: window.location.origin + '/login'
+            client_id: this.clientId,
+            post_logout_redirect_uri: window.location.origin + '/login',
+            id_token_hint: idToken
         });
         
-        window.location.href = 
-            `${this.ssoUrl}/realms/${this.realm}/protocol/openid-connect/logout?${params}`;
-    }
-    
-    generateState() {
-        const array = new Uint8Array(16);
-        crypto.getRandomValues(array);
-        return this.base64UrlEncode(array);
+        window.location.href = `${this.baseURL}/realms/${this.realm}/protocol/openid-connect/logout?${params}`;
     }
 }
 
 // Penggunaan:
 const sso = new SSOClient({
-    ssoUrl: 'http://localhost:8080',
+    baseURL: 'http://localhost:8080',
     realm: 'dinas-pendidikan',
-    clientId: 'client-dinas',
-    redirectUri: 'http://localhost:8070/callback'
+    clientId: 'your-app-client',
+    redirectUri: 'http://localhost:3000/callback'
 });
 
 // Login
-document.getElementById('loginBtn').addEventListener('click', () => sso.login());
+document.getElementById('loginBtn').onclick = () => sso.login();
 
-// Handle callback (di halaman callback)
-if (window.location.search.includes('code=')) {
+// Callback (di halaman /callback)
+if (window.location.pathname === '/callback') {
     sso.handleCallback()
-        .then(tokens => {
-            console.log('Login successful!', tokens);
-            // Simpan tokens dan redirect
+        .then(({ tokens, user }) => {
+            localStorage.setItem('access_token', tokens.access_token);
+            localStorage.setItem('id_token', tokens.id_token);
+            localStorage.setItem('user', JSON.stringify(user));
+            window.location.href = '/dashboard';
         })
         .catch(err => console.error(err));
 }
@@ -570,9 +531,9 @@ if (window.location.search.includes('code=')) {
 
 ---
 
-## Implementasi Laravel (PHP)
+## Implementasi PHP (Laravel)
 
-### File: `app/Services/SSOService.php`
+### File: `app/Services/KeycloakService.php`
 
 ```php
 <?php
@@ -582,69 +543,51 @@ namespace App\Services;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 
-class SSOService
+class KeycloakService
 {
-    private string $ssoUrl;
+    private string $baseUrl;
     private string $realm;
     private string $clientId;
-    private string $clientSecret;
     private string $redirectUri;
     
     public function __construct()
     {
-        $this->ssoUrl = config('sso.url');
-        $this->realm = config('sso.realm');
-        $this->clientId = config('sso.client_id');
-        $this->clientSecret = config('sso.client_secret');
-        $this->redirectUri = config('sso.redirect_uri');
+        $this->baseUrl = config('keycloak.base_url');
+        $this->realm = config('keycloak.realm');
+        $this->clientId = config('keycloak.client_id');
+        $this->redirectUri = config('keycloak.redirect_uri');
     }
     
-    /**
-     * Generate PKCE code verifier dan challenge
-     */
     public function generatePKCE(): array
     {
         $verifier = Str::random(64);
         $challenge = rtrim(strtr(base64_encode(hash('sha256', $verifier, true)), '+/', '-_'), '=');
-        
-        return [
-            'verifier' => $verifier,
-            'challenge' => $challenge
-        ];
+        return compact('verifier', 'challenge');
     }
     
-    /**
-     * Dapatkan URL authorization
-     */
-    public function getAuthorizationUrl(string $state, string $codeChallenge): string
+    public function getAuthUrl(string $state, string $challenge): string
     {
-        $params = http_build_query([
+        return "{$this->baseUrl}/realms/{$this->realm}/protocol/openid-connect/auth?" . http_build_query([
             'client_id' => $this->clientId,
             'redirect_uri' => $this->redirectUri,
             'response_type' => 'code',
             'scope' => 'openid email profile',
             'state' => $state,
-            'code_challenge' => $codeChallenge,
+            'code_challenge' => $challenge,
             'code_challenge_method' => 'S256'
         ]);
-        
-        return "{$this->ssoUrl}/realms/{$this->realm}/protocol/openid-connect/auth?{$params}";
     }
     
-    /**
-     * Exchange authorization code untuk access token
-     */
-    public function exchangeCode(string $code, string $codeVerifier): array
+    public function exchangeCode(string $code, string $verifier): array
     {
         $response = Http::asForm()->post(
-            "{$this->ssoUrl}/realms/{$this->realm}/protocol/openid-connect/token",
+            "{$this->baseUrl}/realms/{$this->realm}/protocol/openid-connect/token",
             [
                 'grant_type' => 'authorization_code',
                 'client_id' => $this->clientId,
-                'client_secret' => $this->clientSecret,
                 'code' => $code,
                 'redirect_uri' => $this->redirectUri,
-                'code_verifier' => $codeVerifier
+                'code_verifier' => $verifier
             ]
         );
         
@@ -655,109 +598,74 @@ class SSOService
         return $response->json();
     }
     
-    /**
-     * Dapatkan user info dari Keycloak
-     */
-    public function getUserInfo(string $accessToken): array
+    public function parseIdToken(string $idToken): array
     {
-        $response = Http::withToken($accessToken)->get(
-            "{$this->ssoUrl}/realms/{$this->realm}/protocol/openid-connect/userinfo"
-        );
-        
-        if ($response->failed()) {
-            throw new \Exception('Failed to get user info');
-        }
-        
-        return $response->json();
+        $parts = explode('.', $idToken);
+        $payload = base64_decode(strtr($parts[1], '-_', '+/'));
+        return json_decode($payload, true);
     }
     
-    /**
-     * Dapatkan URL logout
-     */
     public function getLogoutUrl(string $idToken): string
     {
-        $params = http_build_query([
-            'id_token_hint' => $idToken,
-            'post_logout_redirect_uri' => url('/login')
+        return "{$this->baseUrl}/realms/{$this->realm}/protocol/openid-connect/logout?" . http_build_query([
+            'client_id' => $this->clientId,
+            'post_logout_redirect_uri' => url('/login'),
+            'id_token_hint' => $idToken
         ]);
-        
-        return "{$this->ssoUrl}/realms/{$this->realm}/protocol/openid-connect/logout?{$params}";
     }
 }
 ```
 
-### File: `app/Http/Controllers/SSOController.php`
+### File: `app/Http/Controllers/AuthController.php`
 
 ```php
 <?php
 
 namespace App\Http\Controllers;
 
-use App\Services\SSOService;
+use App\Services\KeycloakService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
 
-class SSOController extends Controller
+class AuthController extends Controller
 {
-    private SSOService $sso;
+    private KeycloakService $keycloak;
     
-    public function __construct(SSOService $sso)
+    public function __construct(KeycloakService $keycloak)
     {
-        $this->sso = $sso;
+        $this->keycloak = $keycloak;
     }
     
-    public function login(Request $request)
+    public function login()
     {
-        $pkce = $this->sso->generatePKCE();
+        $pkce = $this->keycloak->generatePKCE();
         $state = Str::random(32);
         
-        // Simpan di session
-        session(['pkce_verifier' => $pkce['verifier']]);
-        session(['oauth_state' => $state]);
+        session(['pkce_verifier' => $pkce['verifier'], 'oauth_state' => $state]);
         
-        $authUrl = $this->sso->getAuthorizationUrl($state, $pkce['challenge']);
-        
-        return redirect($authUrl);
+        return redirect($this->keycloak->getAuthUrl($state, $pkce['challenge']));
     }
     
     public function callback(Request $request)
     {
-        // Validasi state
         if ($request->state !== session('oauth_state')) {
             abort(400, 'Invalid state');
         }
         
-        // Exchange code
-        $tokens = $this->sso->exchangeCode(
-            $request->code,
-            session('pkce_verifier')
-        );
+        $tokens = $this->keycloak->exchangeCode($request->code, session('pkce_verifier'));
+        $user = $this->keycloak->parseIdToken($tokens['id_token']);
         
-        // Get user info
-        $userInfo = $this->sso->getUserInfo($tokens['access_token']);
-        
-        // Simpan tokens di session
-        session([
-            'sso_access_token' => $tokens['access_token'],
-            'sso_id_token' => $tokens['id_token'],
-            'user' => $userInfo
-        ]);
-        
-        // Clear PKCE data
         session()->forget(['pkce_verifier', 'oauth_state']);
+        session(['user' => $user, 'id_token' => $tokens['id_token']]);
         
         return redirect('/dashboard');
     }
     
-    public function logout(Request $request)
+    public function logout()
     {
-        $idToken = session('sso_id_token');
-        
-        // Clear session
+        $idToken = session('id_token');
         session()->flush();
-        
-        // Redirect ke Keycloak logout
-        return redirect($this->sso->getLogoutUrl($idToken));
+        return redirect($this->keycloak->getLogoutUrl($idToken));
     }
 }
 ```
@@ -774,73 +682,64 @@ import base64
 import hashlib
 import secrets
 import requests
-from urllib.parse import urlencode
 
 class KeycloakSSO:
     def __init__(self):
-        self.sso_url = os.getenv('SSO_URL')
-        self.realm = os.getenv('SSO_REALM')
-        self.client_id = os.getenv('SSO_CLIENT_ID')
-        self.client_secret = os.getenv('SSO_CLIENT_SECRET')
-        self.redirect_uri = os.getenv('SSO_REDIRECT_URI')
+        self.base_url = os.getenv('KEYCLOAK_BASE_URL')
+        self.realm = os.getenv('KEYCLOAK_REALM')
+        self.client_id = os.getenv('KEYCLOAK_CLIENT_ID')
+        self.redirect_uri = os.getenv('KEYCLOAK_REDIRECT_URI')
     
     def generate_pkce(self):
-        """Generate PKCE code verifier dan challenge"""
         verifier = secrets.token_urlsafe(32)
-        challenge_bytes = hashlib.sha256(verifier.encode()).digest()
-        challenge = base64.urlsafe_b64encode(challenge_bytes).rstrip(b'=').decode()
+        challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode()).digest()
+        ).rstrip(b'=').decode()
         return verifier, challenge
     
-    def get_authorization_url(self, state, code_challenge):
-        """Dapatkan URL authorization"""
-        params = urlencode({
+    def get_auth_url(self, state, challenge):
+        params = {
             'client_id': self.client_id,
             'redirect_uri': self.redirect_uri,
             'response_type': 'code',
             'scope': 'openid email profile',
             'state': state,
-            'code_challenge': code_challenge,
+            'code_challenge': challenge,
             'code_challenge_method': 'S256'
-        })
-        return f"{self.sso_url}/realms/{self.realm}/protocol/openid-connect/auth?{params}"
-    
-    def exchange_code(self, code, code_verifier):
-        """Exchange authorization code untuk access token"""
-        token_url = f"{self.sso_url}/realms/{self.realm}/protocol/openid-connect/token"
-        
-        data = {
-            'grant_type': 'authorization_code',
-            'client_id': self.client_id,
-            'code': code,
-            'redirect_uri': self.redirect_uri,
-            'code_verifier': code_verifier
         }
-        
-        if self.client_secret:
-            data['client_secret'] = self.client_secret
-        
-        response = requests.post(token_url, data=data)
-        response.raise_for_status()
-        return response.json()
+        query = '&'.join(f'{k}={v}' for k, v in params.items())
+        return f"{self.base_url}/realms/{self.realm}/protocol/openid-connect/auth?{query}"
     
-    def get_user_info(self, access_token):
-        """Dapatkan user info dari Keycloak"""
-        userinfo_url = f"{self.sso_url}/realms/{self.realm}/protocol/openid-connect/userinfo"
-        
-        response = requests.get(
-            userinfo_url,
-            headers={'Authorization': f'Bearer {access_token}'}
+    def exchange_code(self, code, verifier):
+        response = requests.post(
+            f"{self.base_url}/realms/{self.realm}/protocol/openid-connect/token",
+            data={
+                'grant_type': 'authorization_code',
+                'client_id': self.client_id,
+                'code': code,
+                'redirect_uri': self.redirect_uri,
+                'code_verifier': verifier
+            }
         )
         response.raise_for_status()
         return response.json()
     
+    def parse_id_token(self, id_token):
+        payload = id_token.split('.')[1]
+        # Add padding
+        payload += '=' * (4 - len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload)
+        import json
+        return json.loads(decoded)
+    
     def get_logout_url(self, id_token):
-        """Dapatkan URL logout"""
-        params = urlencode({
-            'id_token_hint': id_token,
-            'post_logout_redirect_uri': f"{os.getenv('APP_URL')}/login"
-        })
-        return f"{self.sso_url}/realms/{self.realm}/protocol/openid-connect/logout?{params}"
+        from urllib.parse import urlencode
+        params = {
+            'client_id': self.client_id,
+            'post_logout_redirect_uri': os.getenv('APP_URL') + '/login',
+            'id_token_hint': id_token
+        }
+        return f"{self.base_url}/realms/{self.realm}/protocol/openid-connect/logout?{urlencode(params)}"
 ```
 
 ### File: `app.py`
@@ -854,51 +753,47 @@ app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
 sso = KeycloakSSO()
 
-@app.route('/sso/login')
-def sso_login():
+@app.route('/login')
+def login():
     verifier, challenge = sso.generate_pkce()
     state = secrets.token_urlsafe(16)
     
     session['pkce_verifier'] = verifier
     session['oauth_state'] = state
     
-    auth_url = sso.get_authorization_url(state, challenge)
-    return redirect(auth_url)
+    return redirect(sso.get_auth_url(state, challenge))
 
-@app.route('/sso/callback')
-def sso_callback():
-    # Validasi state
+@app.route('/callback')
+def callback():
     if request.args.get('state') != session.get('oauth_state'):
         return 'Invalid state', 400
     
-    # Exchange code
-    code = request.args.get('code')
-    tokens = sso.exchange_code(code, session['pkce_verifier'])
+    tokens = sso.exchange_code(request.args['code'], session['pkce_verifier'])
+    user = sso.parse_id_token(tokens['id_token'])
     
-    # Get user info
-    user_info = sso.get_user_info(tokens['access_token'])
-    
-    # Simpan di session
-    session['sso_access_token'] = tokens['access_token']
-    session['sso_id_token'] = tokens['id_token']
-    session['user'] = user_info
-    
-    # Clear PKCE
     session.pop('pkce_verifier', None)
     session.pop('oauth_state', None)
+    session['user'] = user
+    session['id_token'] = tokens['id_token']
     
     return redirect('/dashboard')
 
 @app.route('/logout')
 def logout():
-    id_token = session.get('sso_id_token')
+    id_token = session.get('id_token')
     session.clear()
     return redirect(sso.get_logout_url(id_token))
+
+@app.route('/dashboard')
+def dashboard():
+    if 'user' not in session:
+        return redirect('/login')
+    return f"Welcome, {session['user'].get('name', 'User')}!"
 ```
 
 ---
 
-## Implementasi Node.js
+## Implementasi Node.js (Express)
 
 ### File: `sso/keycloak.js`
 
@@ -908,180 +803,201 @@ const axios = require('axios');
 
 class KeycloakSSO {
     constructor() {
-        this.ssoUrl = process.env.SSO_URL;
-        this.realm = process.env.SSO_REALM;
-        this.clientId = process.env.SSO_CLIENT_ID;
-        this.clientSecret = process.env.SSO_CLIENT_SECRET;
-        this.redirectUri = process.env.SSO_REDIRECT_URI;
+        this.baseUrl = process.env.KEYCLOAK_BASE_URL;
+        this.realm = process.env.KEYCLOAK_REALM;
+        this.clientId = process.env.KEYCLOAK_CLIENT_ID;
+        this.redirectUri = process.env.KEYCLOAK_REDIRECT_URI;
     }
     
     generatePKCE() {
         const verifier = crypto.randomBytes(32).toString('base64url');
-        const challenge = crypto
-            .createHash('sha256')
-            .update(verifier)
-            .digest('base64url');
+        const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
         return { verifier, challenge };
     }
     
-    getAuthorizationUrl(state, codeChallenge) {
+    getAuthUrl(state, challenge) {
         const params = new URLSearchParams({
             client_id: this.clientId,
             redirect_uri: this.redirectUri,
             response_type: 'code',
             scope: 'openid email profile',
-            state: state,
-            code_challenge: codeChallenge,
+            state,
+            code_challenge: challenge,
             code_challenge_method: 'S256'
         });
-        
-        return `${this.ssoUrl}/realms/${this.realm}/protocol/openid-connect/auth?${params}`;
+        return `${this.baseUrl}/realms/${this.realm}/protocol/openid-connect/auth?${params}`;
     }
     
-    async exchangeCode(code, codeVerifier) {
-        const tokenUrl = `${this.ssoUrl}/realms/${this.realm}/protocol/openid-connect/token`;
-        
-        const data = new URLSearchParams({
-            grant_type: 'authorization_code',
-            client_id: this.clientId,
-            code: code,
-            redirect_uri: this.redirectUri,
-            code_verifier: codeVerifier
-        });
-        
-        if (this.clientSecret) {
-            data.append('client_secret', this.clientSecret);
-        }
-        
-        const response = await axios.post(tokenUrl, data);
+    async exchangeCode(code, verifier) {
+        const response = await axios.post(
+            `${this.baseUrl}/realms/${this.realm}/protocol/openid-connect/token`,
+            new URLSearchParams({
+                grant_type: 'authorization_code',
+                client_id: this.clientId,
+                code,
+                redirect_uri: this.redirectUri,
+                code_verifier: verifier
+            })
+        );
         return response.data;
     }
     
-    async getUserInfo(accessToken) {
-        const userinfoUrl = `${this.ssoUrl}/realms/${this.realm}/protocol/openid-connect/userinfo`;
-        
-        const response = await axios.get(userinfoUrl, {
-            headers: { 'Authorization': `Bearer ${accessToken}` }
-        });
-        return response.data;
+    parseIdToken(idToken) {
+        const payload = idToken.split('.')[1];
+        return JSON.parse(Buffer.from(payload, 'base64url').toString());
     }
     
     getLogoutUrl(idToken) {
         const params = new URLSearchParams({
-            id_token_hint: idToken,
-            post_logout_redirect_uri: `${process.env.APP_URL}/login`
+            client_id: this.clientId,
+            post_logout_redirect_uri: process.env.APP_URL + '/login',
+            id_token_hint: idToken
         });
-        
-        return `${this.ssoUrl}/realms/${this.realm}/protocol/openid-connect/logout?${params}`;
+        return `${this.baseUrl}/realms/${this.realm}/protocol/openid-connect/logout?${params}`;
     }
 }
 
 module.exports = new KeycloakSSO();
 ```
 
----
-
-## Session Management
-
-### Periodic Session Check
+### File: `app.js`
 
 ```javascript
-// Cek session setiap 30 detik
-setInterval(async () => {
-    try {
-        const response = await fetch('/auth/validate');
-        if (response.status === 401) {
-            // Session expired, redirect ke login
-            window.location.href = '/login?error=session_expired';
-        }
-    } catch (error) {
-        console.error('Session check failed:', error);
-    }
-}, 30000);
+const express = require('express');
+const session = require('express-session');
+const sso = require('./sso/keycloak');
 
-// Cek saat window focus
-window.addEventListener('focus', async () => {
-    const response = await fetch('/auth/validate');
-    if (response.status === 401) {
-        window.location.href = '/login?error=session_expired';
+const app = express();
+
+app.use(session({
+    secret: 'your-secret-key',
+    resave: false,
+    saveUninitialized: true
+}));
+
+app.get('/login', (req, res) => {
+    const { verifier, challenge } = sso.generatePKCE();
+    const state = require('crypto').randomBytes(16).toString('base64url');
+    
+    req.session.pkceVerifier = verifier;
+    req.session.oauthState = state;
+    
+    res.redirect(sso.getAuthUrl(state, challenge));
+});
+
+app.get('/callback', async (req, res) => {
+    if (req.query.state !== req.session.oauthState) {
+        return res.status(400).send('Invalid state');
+    }
+    
+    try {
+        const tokens = await sso.exchangeCode(req.query.code, req.session.pkceVerifier);
+        const user = sso.parseIdToken(tokens.id_token);
+        
+        delete req.session.pkceVerifier;
+        delete req.session.oauthState;
+        
+        req.session.user = user;
+        req.session.idToken = tokens.id_token;
+        
+        res.redirect('/dashboard');
+    } catch (err) {
+        res.status(500).send(err.message);
     }
 });
+
+app.get('/logout', (req, res) => {
+    const idToken = req.session.idToken;
+    req.session.destroy();
+    res.redirect(sso.getLogoutUrl(idToken));
+});
+
+app.get('/dashboard', (req, res) => {
+    if (!req.session.user) return res.redirect('/login');
+    res.send(`Welcome, ${req.session.user.name}!`);
+});
+
+app.listen(3000);
 ```
 
 ---
 
-## Logout & Token Revocation
+## Session Management
 
-### Endpoint Logout di Go
+### Validasi Session Berkala
 
-```go
-func LogoutHandler(w http.ResponseWriter, r *http.Request) {
-    // Ambil tokens
-    idToken, _ := r.Cookie("sso_id_token")
-    accessToken, _ := r.Cookie("sso_access_token")
-    
-    // Revoke token di Keycloak (optional)
-    if accessToken != nil {
-        revokeToken(accessToken.Value)
-    }
-    
-    // Clear semua cookies
-    clearCookies := []string{
-        "session_id",
-        "sso_access_token",
-        "sso_id_token",
-        "sso_token_expires"
-    }
-    
-    for _, name := range clearCookies {
-        http.SetCookie(w, &http.Cookie{
-            Name:   name,
-            Value:  "",
-            Path:   "/",
-            MaxAge: -1,
-        })
-    }
-    
-    // Redirect ke Keycloak logout
-    logoutURL := sso.Logout(idToken.Value, "http://localhost:8070/login")
-    http.Redirect(w, r, logoutURL, http.StatusFound)
-}
+```javascript
+// Cek session setiap 30 detik
+setInterval(() => {
+    fetch('/api/validate-session')
+        .then(res => {
+            if (res.status === 401) {
+                window.location.href = '/login';
+            }
+        });
+}, 30000);
+
+// Cek saat window focus
+window.addEventListener('focus', () => {
+    fetch('/api/validate-session')
+        .then(res => {
+            if (res.status === 401) {
+                window.location.href = '/login';
+            }
+        });
+});
 ```
 
 ---
 
 ## Troubleshooting
 
-### Error: "Missing parameter: code_challenge_method"
+### Error: "Missing code_challenge_method"
 
-**Solusi**: Pastikan PKCE parameters dikirim saat redirect ke Keycloak:
+**Penyebab**: PKCE tidak dikirim dengan benar.
+
+**Solusi**:
 ```
-code_challenge=xxx
-code_challenge_method=S256
+Pastikan parameter berikut ada di URL authorization:
+- code_challenge=<challenge>
+- code_challenge_method=S256
 ```
 
 ### Error: "Invalid redirect_uri"
 
-**Solusi**: Pastikan redirect URI yang dikonfigurasi di Keycloak sama persis dengan yang dikirim.
+**Penyebab**: Redirect URI tidak cocok dengan yang terdaftar di Keycloak.
 
-### Error: "Invalid client credentials"
+**Solusi**:
+1. Cek konfigurasi client di Keycloak Admin Console
+2. Pastikan `Valid Redirect URIs` mengandung URL callback Anda
+3. Pastikan protokol (http/https) dan port sama persis
 
-**Solusi**: 
-- Untuk public client: Jangan kirim `client_secret`
-- Untuk confidential client: Pastikan secret benar
+### Error: "Invalid state"
 
-### Session tidak sync dengan SSO
+**Penyebab**: Cookie state hilang atau tidak cocok.
 
-**Solusi**: Implementasi periodic session check menggunakan Keycloak UserInfo endpoint.
+**Solusi**:
+1. Pastikan cookie `SameSite=Lax` atau `None` (dengan Secure)
+2. Cek browser tidak memblokir third-party cookies
+3. Pastikan state disimpan sebelum redirect
+
+### Error: "Token exchange failed"
+
+**Penyebab**: Code verifier tidak cocok dengan challenge.
+
+**Solusi**:
+1. Pastikan verifier disimpan saat generate challenge
+2. Gunakan verifier yang sama saat exchange
+3. Jangan encode verifier dua kali
 
 ---
 
 ## Referensi
 
 - [Keycloak Documentation](https://www.keycloak.org/documentation)
-- [OAuth 2.0 PKCE](https://oauth.net/2/pkce/)
-- [OpenID Connect](https://openid.net/connect/)
+- [OAuth 2.0 PKCE RFC](https://datatracker.ietf.org/doc/html/rfc7636)
+- [OpenID Connect Specification](https://openid.net/specs/openid-connect-core-1_0.html)
 
 ---
 
-*Dokumen ini dibuat untuk membantu integrasi SSO Keycloak dengan berbagai platform client.*
+*Panduan ini dibuat untuk integrasi SSO Keycloak dengan website client Dinas Pendidikan DKI Jakarta.*

@@ -7,12 +7,11 @@ Website client untuk Dinas Pendidikan Provinsi DKI Jakarta dengan autentikasi **
 Aplikasi ini **hanya mendukung SSO Keycloak**. Tidak ada login email/password tradisional.
 
 ### Fitur
-- ✅ Login via SSO Keycloak
+- ✅ Login via SSO Keycloak dengan PKCE
 - ✅ Dashboard dengan informasi user dari SSO
 - ✅ Profil pengguna (Read-Only, data dari SSO)
 - ✅ Session management
 - ✅ Auto-logout sync dengan SSO
-- ✅ PKCE (Proof Key for Code Exchange) untuk keamanan
 
 ## Tech Stack
 
@@ -26,40 +25,48 @@ Aplikasi ini **hanya mendukung SSO Keycloak**. Tidak ada login email/password tr
 ```
 client-dinas-pendidikan/
 ├── api/                          # Vercel serverless functions
-│   ├── main_handler.go           # Core routing dan handlers
-│   ├── keycloak_helpers.go       # Helper SSO Keycloak
+│   ├── main_handler.go           # Core routing dan handlers (4700+ lines)
+│   ├── keycloak_helpers.go       # Helper SSO Keycloak (modular, copy-paste ready)
+│   ├── profile_handler.go        # Handler halaman profile
 │   ├── logo.png                  # Logo (embedded)
 │   └── static/
 │       └── sso-handler.js        # SSO JavaScript handler
 │
-├── assets/                       # Aset statis
-│   └── logo.png                  # Logo Dinas Pendidikan
-│
-├── cmd/                          # Entry points
-│   └── dev.go                    # Development server
-│
 ├── docs/                         # Dokumentasi
-│   └── SSO_INTEGRATION_GUIDE.md  # Panduan integrasi SSO
+│   └── SSO_INTEGRATION_GUIDE.md  # 📚 Panduan integrasi SSO (Go, JS, PHP, Python, Node.js)
 │
-├── pkg/                          # Packages reusable
-│   ├── helpers/
-│   │   └── utils.go              # Utility functions
-│   └── sso/
-│       └── keycloak_helpers.go   # SSO module (reusable)
+├── pkg/helpers/                  # Utility functions
+│   └── utils.go
 │
 ├── .env                          # Environment variables
-├── .gitignore
-├── .vercelignore
-├── dev.go                        # Development server (root)
-├── go.mod
-├── go.sum
+├── dev.go                        # Development server
+├── go.mod, go.sum
 ├── README.md
 └── vercel.json                   # Vercel config
 ```
 
-## 📚 Dokumentasi
+## 📚 Untuk Developer Website Client Lain
 
-- **[SSO Integration Guide](docs/SSO_INTEGRATION_GUIDE.md)** - Panduan lengkap untuk mengintegrasikan SSO Keycloak ke website client lain (Go, JavaScript, PHP, Python, Node.js)
+Jika Anda ingin mengintegrasikan SSO Keycloak ke website client Anda:
+
+👉 **Baca: [docs/SSO_INTEGRATION_GUIDE.md](docs/SSO_INTEGRATION_GUIDE.md)**
+
+Panduan mencakup:
+- ✅ **Quickstart** - Integrasi dalam 5 menit
+- ✅ **Konsep SSO & PKCE** - Penjelasan visual dengan diagram
+- ✅ **Go (Golang)** - Full code siap copy-paste
+- ✅ **JavaScript (Browser)** - Class SSOClient
+- ✅ **PHP (Laravel)** - Service & Controller
+- ✅ **Python (Flask)** - Module & routes
+- ✅ **Node.js (Express)** - Full implementation
+- ✅ **Troubleshooting** - Error umum dan solusi
+
+### File Referensi
+
+| File | Deskripsi |
+|------|-----------|
+| `api/keycloak_helpers.go` | Helper SSO yang bisa di-copy ke project Go lain |
+| `docs/SSO_INTEGRATION_GUIDE.md` | Panduan lengkap untuk semua bahasa |
 
 ## Setup
 
@@ -74,11 +81,10 @@ Buat file `.env`:
 
 ```bash
 # SSO Keycloak Configuration
-SSO_URL=http://localhost:8080
-SSO_REALM=dinas-pendidikan
-SSO_CLIENT_ID=client-dinas
-SSO_CLIENT_SECRET=your-client-secret
-SSO_REDIRECT_URI=http://localhost:8070/sso/callback
+KEYCLOAK_BASE_URL=http://localhost:8080
+KEYCLOAK_REALM=dinas-pendidikan
+KEYCLOAK_CLIENT_ID=client-dinas
+KEYCLOAK_REDIRECT_URI=http://localhost:8070/callback
 
 # PostgreSQL Configuration
 POSTGRES_HOST=localhost
@@ -87,7 +93,7 @@ POSTGRES_DB=dinas_pendidikan
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres123
 
-# Supabase (untuk session storage - optional)
+# Supabase (untuk session storage)
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_KEY=your-anon-key
 
@@ -107,12 +113,6 @@ go run dev.go
 
 Server berjalan di `http://localhost:8070`
 
-### Build
-
-```bash
-cd api && go build .
-```
-
 ## Routes
 
 | Route | Description |
@@ -123,30 +123,7 @@ cd api && go build .
 | `/profile` | Profil pengguna (read-only) |
 | `/logout` | Logout dari SSO |
 | `/sso/login` | Memulai flow SSO |
-| `/sso/callback` | Callback dari Keycloak |
-
-## API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/profile` | GET | Mendapatkan data profil user |
-| `/api/logout` | POST | Logout dan clear session |
-| `/api/users/sso-login` | POST | Check/create user dari SSO |
-| `/auth/validate` | GET | Validasi session |
-
-## Untuk Developer Website Client Lain
-
-Jika Anda ingin mengintegrasikan SSO Keycloak ke website client Anda, silakan baca:
-
-📖 **[SSO Integration Guide](docs/SSO_INTEGRATION_GUIDE.md)**
-
-Panduan tersebut mencakup:
-- Arsitektur SSO
-- Implementasi PKCE
-- Contoh kode untuk Go, JavaScript, PHP (Laravel), Python (Flask), dan Node.js
-- Session management
-- Logout dan token revocation
-- Troubleshooting
+| `/callback` | Callback dari Keycloak |
 
 ## License
 
