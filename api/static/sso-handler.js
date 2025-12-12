@@ -1,48 +1,22 @@
 /**
- * SSO Simple Handler untuk Website Client
+ * SSO Keycloak Handler untuk Website Client (Authorization Code Flow)
  * File: static/sso-handler.js
  * 
  * Fungsi:
- * - Handle SSO token langsung dari Portal SSO (SSO Simple)
- * - Process sso_token dan sso_id_token dari URL parameters
+ * - Handle SSO callback dari Keycloak dengan authorization code
+ * - Exchange authorization code untuk access token
+ * - Verify token dengan Keycloak userinfo endpoint
  * - Auto-login user ke aplikasi
+ * - Check atau create user di database
  * - Create session aplikasi
  */
 
 // ============================================
-// SSO SIMPLE HANDLER
+// KONFIGURASI KEYCLOAK
 // ============================================
-
-console.log('🚀 SSO Simple Handler initialized');
-
-// Handle SSO Simple callback
-function handleSSOCallback() {
-    const urlParams = new URLSearchParams(window.location.search);
-    const ssoToken = urlParams.get('sso_token');
-    const ssoIdToken = urlParams.get('sso_id_token');
-    
-    console.log('📋 SSO Simple - URL Parameters:');
-    console.log('  - sso_token:', ssoToken ? 'present' : 'missing');
-    console.log('  - sso_id_token:', ssoIdToken ? 'present' : 'missing');
-    
-    if (ssoToken || ssoIdToken) {
-        console.log('✅ SSO tokens found, processing...');
-        // Tokens are already processed by server-side Go code
-        // Just show success message or redirect
-        showMessage('success', 'SSO login berhasil! Redirecting...');
-        
-        // Clear URL parameters
-        const newUrl = window.location.protocol + "//" + window.location.host + window.location.pathname;
-        window.history.replaceState({}, document.title, newUrl);
-        
-        return true;
-    } else {
-        console.log('❌ No SSO tokens found in URL');
-        return false;
-    }
-}
-
-// Auto-detect Keycloak URL (kept for compatibility)
+// Auto-detect Keycloak URL berdasarkan environment
+// Jika di localhost, gunakan local Keycloak (localhost:8080)
+// Jika di production, gunakan production Keycloak (https://sso.dinas-pendidikan.go.id)
 function getKeycloakBaseUrl() {
     // PENTING: Cek dulu apakah ada Keycloak URL yang disimpan di sessionStorage
     // Ini untuk handle kasus dimana authorization code berasal dari Keycloak yang berbeda
@@ -71,10 +45,9 @@ const SSO_CONFIG = {
 };
 
 // ============================================
-// LEGACY CODE (AUTHORIZATION CODE FLOW) - DISABLED
+// FUNGSI UTAMA: HANDLE SSO CALLBACK (AUTHORIZATION CODE FLOW)
 // ============================================
-/*
-async function handleSSOCallbackLegacy() {
+async function handleSSOCallback() {
     const urlParams = new URLSearchParams(window.location.search);
     const code = urlParams.get('code');
     const state = urlParams.get('state');
@@ -196,15 +169,15 @@ async function handleSSOCallbackLegacy() {
 // EXCHANGE AUTHORIZATION CODE UNTUK ACCESS TOKEN
 // ============================================
 async function exchangeCodeForToken(code) {
-    // PENTING: Gunakan Keycloak URL yang sama dengan yang digunakan saat authorization
-    // Prioritaskan sessionStorage, lalu SSO_CONFIG
-    let keycloakBaseUrl = sessionStorage.getItem('keycloak_base_url');
-    if (!keycloakBaseUrl) {
-        keycloakBaseUrl = SSO_CONFIG.keycloakBaseUrl;
-        console.log('⚠️ No Keycloak URL in sessionStorage, using SSO_CONFIG:', keycloakBaseUrl);
-    }
-    
     try {
+        // PENTING: Gunakan Keycloak URL yang sama dengan yang digunakan saat authorization
+        // Prioritaskan sessionStorage, lalu SSO_CONFIG
+        let keycloakBaseUrl = sessionStorage.getItem('keycloak_base_url');
+        if (!keycloakBaseUrl) {
+            keycloakBaseUrl = SSO_CONFIG.keycloakBaseUrl;
+            console.log('⚠️ No Keycloak URL in sessionStorage, using SSO_CONFIG:', keycloakBaseUrl);
+        }
+        
         const tokenUrl = `${keycloakBaseUrl}/realms/${SSO_CONFIG.realm}/protocol/openid-connect/token`;
         
         console.log('🔄 Exchanging authorization code untuk token...');
@@ -576,7 +549,7 @@ function redirectToKeycloak() {
             state: state
         });
         const authUrl = `${SSO_CONFIG.keycloakBaseUrl}/realms/${SSO_CONFIG.realm}/protocol/openid-connect/auth?${authParams.toString()}`;
-    window.location.href = authUrl;
+        window.location.href = authUrl;
     });
 }
 
@@ -654,8 +627,6 @@ function showLoadingMessage(message) {
     document.body.appendChild(overlay);
 }
 
-*/
-
 // ============================================
 // CLEAR SSO SESSION (UNTUK LOGOUT)
 // ============================================
@@ -675,15 +646,10 @@ function clearSSOSession() {
 // INITIALIZE SAAT PAGE LOAD
 // ============================================
 document.addEventListener('DOMContentLoaded', function() {
-    console.log('🚀 SSO Simple Handler initialized');
-    console.log('🌐 Current URL:', window.location.href);
-    
-    // Handle SSO Simple callback
-    const ssoProcessed = handleSSOCallback();
-    
-    if (!ssoProcessed) {
-        console.log('📋 No SSO tokens found, normal page load');
-    }
+    console.log('🚀 SSO Handler initialized (Authorization Code Flow)');
+    console.log('📋 Config:', SSO_CONFIG);
+    console.log('🌐 Keycloak URL:', SSO_CONFIG.keycloakBaseUrl, '(auto-detected from hostname:', window.location.hostname + ')');
+    handleSSOCallback();
 });
 
 // Export functions untuk digunakan di tempat lain

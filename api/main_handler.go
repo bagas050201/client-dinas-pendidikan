@@ -23,7 +23,6 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	_ "github.com/lib/pq"
-	"golang.org/x/crypto/bcrypt"
 )
 
 //go:embed logo.png
@@ -253,46 +252,14 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		redirectToKeycloakLogin(w, r, false) // false = tanpa prompt=none
 
 	case "/login":
-		// Gunakan handler baru untuk login
-		// Support kedua metode: SSO dan direct login
-		if r.Method == "POST" {
-			LoginPostHandler(w, r)
-		} else {
-			LoginPageHandler(w, r)
-		}
+		// SSO Only: Tampilkan halaman login dengan tombol SSO
+		LoginPageHandler(w, r)
 		return
 	case "/dashboard":
 		// Gunakan handler baru untuk dashboard
 		DashboardHandler(w, r)
 		return
-	case "/info-dinas":
-		// Gunakan handler baru untuk informasi dinas
-		InfoDinasHandler(w, r)
-		return
-	case "/register":
-		if isAuthenticated(r) {
-			http.Redirect(w, r, "/", http.StatusSeeOther)
-			return
-		}
-		renderRegisterPage(w, "")
-	case "/about":
-		if !isAuthenticated(r) {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
-			return
-		}
-		renderAboutPage(w, r)
-	case "/services":
-		if !isAuthenticated(r) {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
-			return
-		}
-		renderServicesPage(w, r)
-	case "/news":
-		if !isAuthenticated(r) {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
-			return
-		}
-		renderNewsPage(w, r)
+	// Halaman info-dinas, about, services, news dihapus - hanya SSO
 	case "/profile":
 		// Gunakan handler baru untuk profile (GET dan POST)
 		ProfileHandler(w, r)
@@ -338,23 +305,13 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 	case path == "/api/callback" && method == "GET":
 		// Handler untuk callback dari SSO (support /api/callback untuk kompatibilitas)
 		SSOCallbackHandler(w, r)
-	case path == "/api/login" && method == "POST":
-		// Gunakan handler baru untuk login API (kompatibilitas dengan AJAX)
-		LoginPostHandler(w, r)
-	case path == "/api/register" && method == "POST":
-		handleRegisterAPI(w, r)
+	// Login dan Register API dihapus - hanya menggunakan SSO Keycloak
 	case path == "/api/logout" && method == "POST":
 		handleLogoutAPI(w, r)
 	case path == "/api/profile" && method == "GET":
 		handleGetProfileAPI(w, r)
-	case path == "/api/profile" && method == "PUT":
-		handleUpdateProfileAPI(w, r)
-	case path == "/api/password" && method == "PUT":
-		handleChangePasswordAPI(w, r)
-	case path == "/api/news" && method == "GET":
-		handleGetNewsAPI(w, r)
-	case path == "/api/announcements" && method == "GET":
-		handleGetAnnouncementsAPI(w, r)
+	// API Update Profile dan Password dihapus - dikelola oleh SSO Keycloak
+	// API news dan announcements dihapus
 	case path == "/api/users/sso-login" && method == "POST":
 		// Endpoint untuk check atau create user dari SSO Keycloak
 		handleSSOUserLoginAPI(w, r)
@@ -497,197 +454,7 @@ func LoginPageHandler(w http.ResponseWriter, r *http.Request) {
 	renderLoginPage(w, errorMsg, "")
 }
 
-// LoginPostHandler menangani POST request untuk login
-// Flow:
-// 1. Parse email dan password dari request
-// 2. Validasi input
-// 3. Cek user di PostgreSQL (tabel pengguna)
-// 4. Verifikasi password (bcrypt atau plain text fallback)
-// 5. Cek status aktif user
-// 6. Buat session di database (tabel sesi_login)
-// 7. Set cookie client_dinas_session
-// 8. Redirect ke /dashboard (atau next param) atau return JSON jika Accept: application/json
-func LoginPostHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("🔐 LoginPostHandler: POST request received from %s", r.RemoteAddr)
-	// Parse request body
-	var req struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
-	}
-
-	// Cek Content-Type untuk menentukan cara parse
-	contentType := r.Header.Get("Content-Type")
-	if strings.Contains(contentType, "application/json") {
-		// Parse dari JSON
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			log.Printf("ERROR parsing JSON: %v", err)
-			helpers.WriteError(w, http.StatusBadRequest, "Invalid request format")
-			return
-		}
-	} else {
-		// Parse dari form data
-		if err := r.ParseForm(); err != nil {
-			log.Printf("ERROR parsing form: %v", err)
-			helpers.WriteError(w, http.StatusBadRequest, "Invalid request format")
-			return
-		}
-		req.Email = r.FormValue("email")
-		req.Password = r.FormValue("password")
-	}
-
-	// Validasi input
-	if !helpers.ValidateEmail(req.Email) {
-		log.Printf("ERROR: Email tidak valid: %s", req.Email)
-		helpers.WriteError(w, http.StatusBadRequest, "Email tidak valid")
-		return
-	}
-
-	if len(req.Password) < 6 {
-		log.Printf("ERROR: Password terlalu pendek")
-		helpers.WriteError(w, http.StatusBadRequest, "Password minimal 6 karakter")
-		return
-	}
-
-	// Ambil user dari PostgreSQL database
-	log.Printf("🔍 LoginPostHandler: authenticating user: %s", req.Email)
-
-	db, err := connectPostgreSQL()
-	if err != nil {
-		log.Printf("❌ LoginPostHandler: failed to connect to PostgreSQL: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal terhubung ke database")
-		return
-	}
-	defer db.Close()
-
-	// Query user from PostgreSQL
-	query := `SELECT id_pengguna, email, nama_lengkap, peran, aktif, password FROM pengguna WHERE email = $1`
-
-	var user map[string]interface{}
-	var idPengguna, email, namaLengkap, peran, password string
-	var aktif bool
-
-	err = db.QueryRow(query, req.Email).Scan(&idPengguna, &email, &namaLengkap, &peran, &aktif, &password)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			log.Printf("❌ LoginPostHandler: user not found: %s", req.Email)
-			helpers.WriteError(w, http.StatusUnauthorized, "Email atau password salah")
-			return
-		}
-		log.Printf("❌ LoginPostHandler: error querying user: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal mengambil data pengguna")
-		return
-	}
-
-	user = map[string]interface{}{
-		"id_pengguna":  idPengguna,
-		"email":        email,
-		"nama_lengkap": namaLengkap,
-		"peran":        peran,
-		"aktif":        aktif,
-		"password":     password,
-	}
-
-	log.Printf("✅ LoginPostHandler: found user: %s (%s)", namaLengkap, email)
-
-	// Verifikasi password
-	var passwordMatch bool
-	if passwordHash, ok := user["password"].(string); ok && passwordHash != "" {
-		// Cek dengan bcrypt
-		if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err == nil {
-			passwordMatch = true
-		}
-	} else {
-		// Fallback: cek password plain text (untuk backward compatibility)
-		if password, ok := user["password"].(string); ok {
-			if password == req.Password {
-				passwordMatch = true
-			}
-		}
-	}
-
-	if !passwordMatch {
-		log.Printf("ERROR: Password salah untuk user: %s", req.Email)
-		helpers.WriteError(w, http.StatusUnauthorized, "Email atau password salah")
-		return
-	}
-
-	// Cek status aktif
-	if active, ok := user["aktif"].(bool); !ok || !active {
-		log.Printf("ERROR: User tidak aktif: %s", req.Email)
-		helpers.WriteError(w, http.StatusForbidden, "Akun tidak aktif")
-		return
-	}
-
-	// Buat session di PostgreSQL database
-	userID := user["id_pengguna"].(string)
-	log.Printf("🔍 LoginPostHandler: creating session for userID: %s", userID)
-
-	// Generate session ID
-	sessionID, err := helpers.GenerateSessionID()
-	if err != nil {
-		log.Printf("❌ LoginPostHandler: failed to generate session ID: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal membuat session ID")
-		return
-	}
-
-	// Create session in PostgreSQL
-	expiresAt := time.Now().Add(24 * time.Hour)
-	ip := r.RemoteAddr
-	userAgent := r.Header.Get("User-Agent")
-
-	// Ensure session table exists
-	if err := createSessionTableIfNotExists(); err != nil {
-		log.Printf("❌ LoginPostHandler: failed to ensure session table: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal menyiapkan database")
-		return
-	}
-
-	// Insert session into PostgreSQL
-	insertQuery := `INSERT INTO sesi_login (id_pengguna, id_sesi, ip, user_agent, kadaluarsa) VALUES ($1, $2, $3, $4, $5)`
-	_, err = db.Exec(insertQuery, userID, sessionID, ip, userAgent, expiresAt)
-	if err != nil {
-		log.Printf("❌ LoginPostHandler: failed to create session: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal membuat session")
-		return
-	}
-
-	log.Printf("✅ LoginPostHandler: session created successfully: %s", sessionID)
-
-	// Set cookie dengan nama yang berbeda dari SSO server
-	// PENTING: Gunakan cookie name yang berbeda untuk mencegah shared cookie
-	// SSO server menggunakan "sso_admin_session", client website menggunakan "client_dinas_session"
-	helpers.SetCookie(w, r, "client_dinas_session", sessionID, 86400) // 24 jam
-
-	// Log untuk debugging
-	log.Printf("✅ Login berhasil: %s, session: %s", req.Email, sessionID)
-
-	// Cek apakah request meminta JSON response
-	acceptHeader := r.Header.Get("Accept")
-	if strings.Contains(acceptHeader, "application/json") {
-		// Return JSON untuk AJAX request
-		next := r.URL.Query().Get("next")
-		if next == "" {
-			next = "/dashboard"
-		}
-		helpers.WriteJSON(w, http.StatusOK, map[string]interface{}{
-			"success":    true,
-			"message":    "Login berhasil",
-			"session_id": sessionID,
-			"redirect":   next,
-		})
-		return
-	}
-
-	// Redirect ke dashboard atau next param
-	next := r.URL.Query().Get("next")
-	if next == "" {
-		next = "/dashboard"
-	}
-
-	// PENTING: Redirect dengan status 303 (See Other) untuk POST request
-	// Jangan tulis response body sebelum redirect
-	http.Redirect(w, r, next, http.StatusSeeOther)
-}
+// LoginPostHandler telah dihapus - Aplikasi ini hanya menggunakan SSO Keycloak
 
 // RequireAuth middleware — perbaikan
 func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -1601,22 +1368,20 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, cou
         </div>
 
         <div class="actions-grid">
-            <a href="/info-dinas" class="action-card">
-                <div class="action-title">📝 Informasi Dinas</div>
-                <div class="action-desc">Lihat informasi lengkap tentang Dinas Pendidikan DKI Jakarta</div>
-            </a>
             <a href="/profile" class="action-card">
                 <div class="action-title">👤 Profil Saya</div>
-                <div class="action-desc">Kelola informasi profil dan pengaturan akun</div>
+                <div class="action-desc">Lihat informasi profil akun Anda</div>
             </a>
-            <a href="/api/news" class="action-card">
-                <div class="action-title">📰 Berita & Pengumuman</div>
-                <div class="action-desc">Baca berita dan pengumuman terbaru</div>
+            <a href="/logout" class="action-card" style="background: linear-gradient(135deg, #ef4444 0%%, #dc2626 100%%); color: white;">
+                <div class="action-title">🚪 Logout</div>
+                <div class="action-desc">Keluar dari sistem SSO</div>
             </a>
-            <a href="#" class="action-card">
-                <div class="action-title">🛠️ Layanan</div>
-                <div class="action-desc">Akses berbagai layanan yang tersedia</div>
-            </a>
+        </div>
+        
+        <div style="margin-top: 24px; padding: 20px; background: #f0fdf4; border-left: 4px solid #22c55e; border-radius: 8px;">
+            <p style="color: #166534; margin: 0; font-size: 14px;">
+                ✅ <strong>Autentikasi SSO Berhasil!</strong> Anda telah login menggunakan Single Sign-On Keycloak.
+            </p>
         </div>
     </div>
 
@@ -2742,13 +2507,7 @@ func ProfileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Handle POST untuk update profile
-	if r.Method == "POST" {
-		handleUpdateProfile(w, r, userID)
-		return
-	}
-
-	// GET: tampilkan form profil
+	// GET: tampilkan form profil (Read Only)
 	user, err := getUserByID(userID)
 	if err != nil {
 		log.Printf("ERROR getting user: %v", err)
@@ -2759,75 +2518,7 @@ func ProfileHandler(w http.ResponseWriter, r *http.Request) {
 	renderProfilePageNew(w, user)
 }
 
-// handleUpdateProfile menangani update profil user
-func handleUpdateProfile(w http.ResponseWriter, r *http.Request, userID string) {
-	// Parse form data
-	if err := r.ParseForm(); err != nil {
-		helpers.WriteError(w, http.StatusBadRequest, "Invalid request")
-		return
-	}
-
-	namaLengkap := r.FormValue("nama_lengkap")
-	email := r.FormValue("email")
-
-	// Validasi
-	if !helpers.ValidateEmail(email) {
-		helpers.WriteError(w, http.StatusBadRequest, "Email tidak valid")
-		return
-	}
-
-	if len(namaLengkap) < 3 {
-		helpers.WriteError(w, http.StatusBadRequest, "Nama lengkap minimal 3 karakter")
-		return
-	}
-
-	// Update di Supabase
-	supabaseURL := os.Getenv("SUPABASE_URL")
-	supabaseKey := os.Getenv("SUPABASE_KEY")
-	if supabaseURL == "" || supabaseKey == "" {
-		helpers.WriteError(w, http.StatusInternalServerError, "Konfigurasi server tidak lengkap")
-		return
-	}
-
-	updateData := map[string]interface{}{
-		"nama_lengkap": namaLengkap,
-		"email":        email,
-	}
-
-	updateJSON, _ := json.Marshal(updateData)
-	userIDEncoded := url.QueryEscape(userID)
-	// Schema: id_pengguna adalah primary key, bukan id
-	apiURL := fmt.Sprintf("%s/rest/v1/pengguna?id_pengguna=eq.%s", supabaseURL, userIDEncoded)
-
-	httpReq, err := http.NewRequest("PATCH", apiURL, bytes.NewBuffer(updateJSON))
-	if err != nil {
-		log.Printf("ERROR creating request: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Terjadi kesalahan")
-		return
-	}
-
-	httpReq.Header.Set("apikey", supabaseKey)
-	httpReq.Header.Set("Authorization", "Bearer "+supabaseKey)
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		log.Printf("ERROR calling Supabase: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal mengupdate profil")
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		log.Printf("ERROR Supabase response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal mengupdate profil")
-		return
-	}
-
-	// Redirect kembali ke profile dengan success message
-	http.Redirect(w, r, "/profile?success=1", http.StatusSeeOther)
-}
+// handleUpdateProfile telah dihapus - Data user dikelola oleh SSO Keycloak
 
 // renderProfilePageNew menampilkan halaman profil (versi baru untuk handler modular)
 func renderProfilePageNew(w http.ResponseWriter, user map[string]interface{}) {
@@ -2997,26 +2688,25 @@ func renderProfilePageNew(w http.ResponseWriter, user map[string]interface{}) {
             <div class="success-message" id="successMsg">
                 Profil berhasil diperbarui!
             </div>
-            <form method="POST" action="/profile">
+            <div style="background: #eff6ff; border-left: 4px solid #3b82f6; padding: 16px; margin-bottom: 24px; border-radius: 4px;">
+                <p style="color: #1e40af; margin: 0; font-size: 14px;">
+                    <strong>Info:</strong> Data profil Anda dikelola secara terpusat melalui sistem SSO. Jika ada kesalahan data, silakan hubungi administrator atau update melalui portal SSO.
+                </p>
+            </div>
+            <form>
                 <div class="form-group">
                     <label for="nama_lengkap">Nama Lengkap</label>
-                    <input type="text" id="nama_lengkap" name="nama_lengkap" value="%s" required>
+                    <input type="text" id="nama_lengkap" name="nama_lengkap" value="%s" disabled style="background-color: #f1f5f9; cursor: not-allowed;">
                 </div>
                 <div class="form-group">
                     <label for="email">Email</label>
-                    <input type="email" id="email" name="email" value="%s" required>
+                    <input type="email" id="email" name="email" value="%s" disabled style="background-color: #f1f5f9; cursor: not-allowed;">
                 </div>
                 <div class="form-group">
                     <label for="peran">Peran</label>
-                    <input type="text" id="peran" name="peran" value="%s" disabled>
+                    <input type="text" id="peran" name="peran" value="%s" disabled style="background-color: #f1f5f9; cursor: not-allowed;">
                 </div>
-                <button type="submit" class="btn-primary">Simpan Perubahan</button>
             </form>
-            <div style="margin-top: 32px; padding-top: 32px; border-top: 1px solid #e2e8f0;">
-                <h3 style="font-size: 18px; font-weight: 600; color: #1e293b; margin-bottom: 16px;">Ubah Password</h3>
-                <p style="color: #64748b; margin-bottom: 16px;">Untuk mengubah password, silakan gunakan fitur "Ubah Password" di halaman profil lengkap.</p>
-                <a href="/profile" style="color: #6366f1; text-decoration: none; font-weight: 500;">Buka Halaman Profil Lengkap →</a>
-            </div>
         </div>
     </div>
     <script>
@@ -3984,347 +3674,9 @@ func getCurrentUser(r *http.Request) (map[string]interface{}, error) {
 }
 
 // API Handlers
-func handleLoginAPI(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
-	}
+// handleLoginAPI telah dihapus sepenuhnya
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		helpers.WriteError(w, http.StatusBadRequest, "Invalid request")
-		return
-	}
-
-	// Validate input
-	if !helpers.ValidateEmail(req.Email) {
-		helpers.WriteError(w, http.StatusBadRequest, "Email tidak valid")
-		return
-	}
-
-	if len(req.Password) < 6 {
-		helpers.WriteError(w, http.StatusBadRequest, "Password minimal 6 karakter")
-		return
-	}
-
-	// Validate Supabase connection
-	supabaseURL := getSupabaseURL()
-	supabaseKey := getSupabaseKey()
-	if supabaseURL == "" || supabaseKey == "" {
-		log.Println("ERROR: SUPABASE_URL or SUPABASE_KEY not set")
-		helpers.WriteError(w, http.StatusInternalServerError, "Konfigurasi server tidak lengkap")
-		return
-	}
-
-	// Get user from Supabase with proper URL encoding
-	emailEncoded := url.QueryEscape(req.Email)
-	apiURL := fmt.Sprintf("%s/rest/v1/pengguna?email=eq.%s&select=*", getSupabaseURL(), emailEncoded)
-
-	httpReq, err := http.NewRequest("GET", apiURL, nil)
-	if err != nil {
-		log.Printf("ERROR creating request: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Terjadi kesalahan")
-		return
-	}
-
-	httpReq.Header.Set("apikey", getSupabaseKey())
-	httpReq.Header.Set("Authorization", "Bearer "+getSupabaseKey())
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		log.Printf("ERROR calling Supabase: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal terhubung ke database")
-		return
-	}
-	defer resp.Body.Close()
-
-	// Read response body for debugging
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("ERROR Supabase response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal mengambil data pengguna")
-		return
-	}
-
-	var users []map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &users); err != nil {
-		log.Printf("ERROR parsing response: %v, Body: %s", err, string(bodyBytes))
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal memproses data")
-		return
-	}
-
-	if len(users) == 0 {
-		helpers.WriteError(w, http.StatusUnauthorized, "Email atau password salah")
-		return
-	}
-
-	user := users[0]
-
-	// Verify password
-	var passwordMatch bool
-	if passwordHash, ok := user["password"].(string); ok && passwordHash != "" {
-		// Verify password with bcrypt
-		if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err == nil {
-			passwordMatch = true
-		}
-	} else {
-		// Fallback: Try password_hash field (for backward compatibility)
-		if password, ok := user["password"].(string); ok {
-			if password == req.Password {
-				passwordMatch = true
-			}
-		}
-	}
-
-	if !passwordMatch {
-		helpers.WriteError(w, http.StatusUnauthorized, "Email atau password salah")
-		return
-	}
-
-	// Check if user is active
-	if active, ok := user["aktif"].(bool); !ok || !active {
-		helpers.WriteError(w, http.StatusForbidden, "Akun tidak aktif")
-		return
-	}
-
-	// Create session
-	sessionID, _ := helpers.GenerateSessionID()
-	expiresAt := time.Now().Add(24 * time.Hour)
-
-	// Schema: id_pengguna adalah primary key, bukan id
-	userID := user["id_pengguna"]
-	if userID == nil {
-		// Fallback ke id jika id_pengguna tidak ada (untuk backward compatibility)
-		userID = user["id"]
-		if userID == nil {
-			log.Printf("ERROR: User tidak memiliki kolom id_pengguna atau id. User keys: %v", getMapKeys(user))
-			helpers.WriteError(w, http.StatusInternalServerError, "Data user tidak valid")
-			return
-		}
-	}
-
-	// Siapkan data session sesuai schema Supabase
-	// Schema: id (uuid, PK), id_sesi (text), id_pengguna (uuid), created_at (timestamp), kadaluarsa (timestamp), ip (text), user_agent (text), aktif (bool)
-	sessionData := map[string]interface{}{
-		"id_pengguna": userID,                         // user_id → id_pengguna
-		"id_sesi":     sessionID,                      // session_id → id_sesi
-		"ip":          getIPAddress(r),                // ip_address → ip
-		"user_agent":  r.UserAgent(),                  // user_agent (sudah benar)
-		"kadaluarsa":  expiresAt.Format(time.RFC3339), // expires_at → kadaluarsa
-	}
-
-	sessionJSON, _ := json.Marshal(sessionData)
-	apiURL = fmt.Sprintf("%s/rest/v1/sesi_login", getSupabaseURL())
-	httpReq, err = http.NewRequest("POST", apiURL, bytes.NewBuffer(sessionJSON))
-	if err != nil {
-		log.Printf("ERROR creating request: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Terjadi kesalahan")
-		return
-	}
-	httpReq.Header.Set("apikey", getSupabaseKey())
-	httpReq.Header.Set("Authorization", "Bearer "+getSupabaseKey())
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Prefer", "return=representation")
-
-	resp, err = http.DefaultClient.Do(httpReq)
-	if err != nil {
-		log.Printf("ERROR calling Supabase: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal membuat sesi")
-		return
-	}
-	resp.Body.Close()
-
-	// Set cookie
-	helpers.SetCookie(w, r, "session_id", sessionID, 86400)
-
-	// Return success with redirect instruction
-	helpers.WriteJSON(w, http.StatusOK, map[string]interface{}{
-		"success":  true,
-		"message":  "Login berhasil",
-		"redirect": "/",
-	})
-	return
-}
-
-func handleRegisterAPI(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Email       string `json:"email"`
-		Password    string `json:"password"`
-		NamaLengkap string `json:"nama_lengkap"`
-		Peran       string `json:"peran"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		helpers.WriteError(w, http.StatusBadRequest, "Invalid request")
-		return
-	}
-
-	// Validate input
-	if !helpers.ValidateEmail(req.Email) {
-		helpers.WriteError(w, http.StatusBadRequest, "Email tidak valid")
-		return
-	}
-
-	if len(req.Password) < 6 {
-		helpers.WriteError(w, http.StatusBadRequest, "Password minimal 6 karakter")
-		return
-	}
-
-	if len(req.NamaLengkap) < 3 {
-		helpers.WriteError(w, http.StatusBadRequest, "Nama lengkap minimal 3 karakter")
-		return
-	}
-
-	validRoles := map[string]bool{"guru": true, "wali": true, "murid": true, "admin": true, "user": true}
-	if !validRoles[req.Peran] {
-		helpers.WriteError(w, http.StatusBadRequest, "Peran tidak valid")
-		return
-	}
-
-	// Validate Supabase connection
-	supabaseURL := getSupabaseURL()
-	supabaseKey := getSupabaseKey()
-	if supabaseURL == "" || supabaseKey == "" {
-		log.Println("ERROR: SUPABASE_URL or SUPABASE_KEY not set")
-		helpers.WriteError(w, http.StatusInternalServerError, "Konfigurasi server tidak lengkap")
-		return
-	}
-
-	// Check if email exists with proper URL encoding
-	emailEncoded := url.QueryEscape(req.Email)
-	// Schema: id_pengguna adalah primary key, bukan id
-	apiURL := fmt.Sprintf("%s/rest/v1/pengguna?email=eq.%s&select=id_pengguna", supabaseURL, emailEncoded)
-	httpReq, err := http.NewRequest("GET", apiURL, nil)
-	if err != nil {
-		log.Printf("ERROR creating request: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Terjadi kesalahan")
-		return
-	}
-	httpReq.Header.Set("apikey", getSupabaseKey())
-	httpReq.Header.Set("Authorization", "Bearer "+getSupabaseKey())
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		log.Printf("ERROR calling Supabase: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal terhubung ke database")
-		return
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("ERROR Supabase response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal memeriksa email")
-		return
-	}
-
-	var existingUsers []map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &existingUsers); err != nil {
-		log.Printf("ERROR parsing response: %v, Body: %s", err, string(bodyBytes))
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal memproses data")
-		return
-	}
-
-	if len(existingUsers) > 0 {
-		helpers.WriteError(w, http.StatusConflict, "Email sudah terdaftar")
-		return
-	}
-
-	// Hash password
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
-	if err != nil {
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal mengenkripsi password")
-		return
-	}
-
-	// Create user
-	userData := map[string]interface{}{
-		"email":        req.Email,
-		"password":     string(hashedPassword),
-		"nama_lengkap": helpers.SanitizeInput(req.NamaLengkap),
-		"peran":        req.Peran,
-		"aktif":        true,
-	}
-
-	userJSON, _ := json.Marshal(userData)
-	apiURL = fmt.Sprintf("%s/rest/v1/pengguna", getSupabaseURL())
-	httpReq, err = http.NewRequest("POST", apiURL, bytes.NewBuffer(userJSON))
-	if err != nil {
-		log.Printf("ERROR creating request: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Terjadi kesalahan")
-		return
-	}
-	httpReq.Header.Set("apikey", getSupabaseKey())
-	httpReq.Header.Set("Authorization", "Bearer "+getSupabaseKey())
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Prefer", "return=representation")
-
-	resp, err = http.DefaultClient.Do(httpReq)
-	if err != nil {
-		log.Printf("ERROR calling Supabase: %v", err)
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal membuat akun")
-		return
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ = io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		log.Printf("ERROR Supabase response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal membuat akun")
-		return
-	}
-
-	var newUsers []map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &newUsers); err != nil {
-		log.Printf("ERROR parsing response: %v, Body: %s", err, string(bodyBytes))
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal memproses data")
-		return
-	}
-
-	if len(newUsers) == 0 {
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal membuat akun")
-		return
-	}
-
-	newUser := newUsers[0]
-
-	// Auto-login: Create session menggunakan session.CreateSession
-	// Schema: id_pengguna adalah primary key, bukan id
-	userIDVal := newUser["id_pengguna"]
-	if userIDVal == nil {
-		// Fallback ke id jika id_pengguna tidak ada (untuk backward compatibility)
-		userIDVal = newUser["id"]
-		if userIDVal == nil {
-			log.Printf("ERROR: User tidak memiliki kolom id_pengguna atau id. User keys: %v", getMapKeys(newUser))
-			helpers.WriteError(w, http.StatusInternalServerError, "Data user tidak valid")
-			return
-		}
-	}
-
-	// Convert userID ke string untuk konsistensi
-	userID := fmt.Sprintf("%v", userIDVal)
-
-	// Buat session menggunakan createSession (fungsi lokal)
-	sessionID, err := createSession(userID, r)
-	if err != nil {
-		log.Printf("WARNING: Error creating session: %v", err)
-		// Lanjutkan meskipun error, registrasi tetap berhasil
-	} else {
-		// Set cookie dengan nama yang berbeda dari SSO server
-		// PENTING: Gunakan cookie name yang berbeda untuk mencegah shared cookie
-		helpers.SetCookie(w, r, "client_dinas_session", sessionID, 86400) // 24 jam
-		log.Printf("✅ Session created for new user: %s", sessionID)
-	}
-
-	// Return success with redirect instruction
-	helpers.WriteJSON(w, http.StatusOK, map[string]interface{}{
-		"success":  true,
-		"message":  "Registrasi berhasil",
-		"redirect": "/",
-	})
-	return
-}
+// handleRegisterAPI telah dihapus - Registrasi dilakukan melalui SSO Keycloak
 
 func handleLogoutAPI(w http.ResponseWriter, r *http.Request) {
 	sessionID, err := helpers.GetCookie(r, "session_id")
@@ -4376,177 +3728,8 @@ func handleGetProfileAPI(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func handleUpdateProfileAPI(w http.ResponseWriter, r *http.Request) {
-	user, err := getCurrentUser(r)
-	if err != nil {
-		helpers.WriteError(w, http.StatusUnauthorized, "Tidak terautentikasi")
-		return
-	}
-
-	var req struct {
-		NamaLengkap string `json:"nama_lengkap"`
-		Email       string `json:"email"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		helpers.WriteError(w, http.StatusBadRequest, "Invalid request")
-		return
-	}
-
-	if len(req.NamaLengkap) < 3 {
-		helpers.WriteError(w, http.StatusBadRequest, "Nama lengkap minimal 3 karakter")
-		return
-	}
-
-	if !helpers.ValidateEmail(req.Email) {
-		helpers.WriteError(w, http.StatusBadRequest, "Email tidak valid")
-		return
-	}
-
-	// Check if email is taken by another user
-	// Schema: id_pengguna adalah primary key, bukan id
-	emailEncoded := url.QueryEscape(req.Email)
-	userIDValue := user["id_pengguna"]
-	if userIDValue == nil {
-		userIDValue = user["id"]
-	}
-	url := fmt.Sprintf("%s/rest/v1/pengguna?email=eq.%s&id_pengguna=neq.%v&select=id_pengguna", getSupabaseURL(), emailEncoded, userIDValue)
-	httpReq, _ := http.NewRequest("GET", url, nil)
-	httpReq.Header.Set("apikey", getSupabaseKey())
-	httpReq.Header.Set("Authorization", "Bearer "+getSupabaseKey())
-
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err == nil {
-		defer resp.Body.Close()
-		var existingUsers []map[string]interface{}
-		json.NewDecoder(resp.Body).Decode(&existingUsers)
-		if len(existingUsers) > 0 {
-			helpers.WriteError(w, http.StatusConflict, "Email sudah digunakan")
-			return
-		}
-	}
-
-	// Update user
-	// Schema: tidak ada kolom updated_at di tabel pengguna
-	updateData := map[string]interface{}{
-		"nama_lengkap": helpers.SanitizeInput(req.NamaLengkap),
-		"email":        req.Email,
-	}
-
-	updateJSON, _ := json.Marshal(updateData)
-	// Schema: id_pengguna adalah primary key, bukan id
-	// Reuse userIDValue dari scope sebelumnya atau get baru
-	var updateUserID interface{}
-	updateUserID = user["id_pengguna"]
-	if updateUserID == nil {
-		updateUserID = user["id"]
-	}
-	updateURL := fmt.Sprintf("%s/rest/v1/pengguna?id_pengguna=eq.%v", getSupabaseURL(), updateUserID)
-	httpReq, _ = http.NewRequest("PATCH", updateURL, bytes.NewBuffer(updateJSON))
-	httpReq.Header.Set("apikey", getSupabaseKey())
-	httpReq.Header.Set("Authorization", "Bearer "+getSupabaseKey())
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Prefer", "return=representation")
-
-	_, err = http.DefaultClient.Do(httpReq)
-	if err != nil {
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal mengupdate profile")
-		return
-	}
-
-	helpers.WriteSuccess(w, "Profile berhasil diupdate", nil)
-}
-
-func handleChangePasswordAPI(w http.ResponseWriter, r *http.Request) {
-	user, err := getCurrentUser(r)
-	if err != nil {
-		helpers.WriteError(w, http.StatusUnauthorized, "Tidak terautentikasi")
-		return
-	}
-
-	var req struct {
-		OldPassword string `json:"old_password"`
-		NewPassword string `json:"new_password"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		helpers.WriteError(w, http.StatusBadRequest, "Invalid request")
-		return
-	}
-
-	if len(req.NewPassword) < 6 {
-		helpers.WriteError(w, http.StatusBadRequest, "Password baru minimal 6 karakter")
-		return
-	}
-
-	// Get current password hash
-	// Schema: id_pengguna adalah primary key, bukan id
-	userIDValue := user["id_pengguna"]
-	if userIDValue == nil {
-		userIDValue = user["id"]
-	}
-	url := fmt.Sprintf("%s/rest/v1/pengguna?id_pengguna=eq.%v&select=password", getSupabaseURL(), userIDValue)
-	httpReq, _ := http.NewRequest("GET", url, nil)
-	httpReq.Header.Set("apikey", getSupabaseKey())
-	httpReq.Header.Set("Authorization", "Bearer "+getSupabaseKey())
-
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		helpers.WriteError(w, http.StatusInternalServerError, "Terjadi kesalahan")
-		return
-	}
-	defer resp.Body.Close()
-
-	var users []map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&users)
-	if len(users) == 0 {
-		helpers.WriteError(w, http.StatusNotFound, "User tidak ditemukan")
-		return
-	}
-
-	passwordHash := fmt.Sprintf("%v", users[0]["password"])
-
-	// Verify old password
-	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.OldPassword)); err != nil {
-		helpers.WriteError(w, http.StatusUnauthorized, "Password lama salah")
-		return
-	}
-
-	// Hash new password
-	newHashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
-	if err != nil {
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal mengenkripsi password")
-		return
-	}
-
-	// Update password
-	// Schema: tidak ada kolom updated_at di tabel pengguna
-	updateData := map[string]interface{}{
-		"password": string(newHashedPassword),
-	}
-
-	updateJSON, _ := json.Marshal(updateData)
-	// Schema: id_pengguna adalah primary key, bukan id
-	// Reuse userIDValue dari scope sebelumnya atau get baru
-	var updateUserID interface{}
-	updateUserID = user["id_pengguna"]
-	if updateUserID == nil {
-		updateUserID = user["id"]
-	}
-	updateURL := fmt.Sprintf("%s/rest/v1/pengguna?id_pengguna=eq.%v", getSupabaseURL(), updateUserID)
-	httpReq, _ = http.NewRequest("PATCH", updateURL, bytes.NewBuffer(updateJSON))
-	httpReq.Header.Set("apikey", getSupabaseKey())
-	httpReq.Header.Set("Authorization", "Bearer "+getSupabaseKey())
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	_, err = http.DefaultClient.Do(httpReq)
-	if err != nil {
-		helpers.WriteError(w, http.StatusInternalServerError, "Gagal mengubah password")
-		return
-	}
-
-	helpers.WriteSuccess(w, "Password berhasil diubah", nil)
-}
+// handleUpdateProfileAPI telah dihapus - Data user dikelola oleh SSO Keycloak
+// handleChangePasswordAPI telah dihapus - Password dikelola oleh SSO Keycloak
 
 func handleGetNewsAPI(w http.ResponseWriter, r *http.Request) {
 	url := fmt.Sprintf("%s/rest/v1/berita?published=eq.true&order=created_at.desc&limit=20", getSupabaseURL())
@@ -4692,16 +3875,10 @@ func handleSSOUserLoginAPI(w http.ResponseWriter, r *http.Request) {
 			// "keycloak_id": req.KeycloakID,
 		}
 
-		// Set password default (random) untuk SSO user
-		// User SSO tidak akan login dengan password, tapi tetap perlu kolom password
-		defaultPassword := "sso_user_" + req.KeycloakID // Placeholder, tidak akan digunakan
-		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(defaultPassword), bcrypt.DefaultCost)
-		if err != nil {
-			log.Printf("ERROR hashing password: %v", err)
-			helpers.WriteError(w, http.StatusInternalServerError, "Failed to create user")
-			return
-		}
-		userData["password"] = string(hashedPassword)
+		// Set password default (random string) untuk SSO user
+		// User SSO tidak akan login dengan password, tapi tetap perlu kolom password jika NOT NULL
+		// Kita tidak perlu hash password karena tidak akan pernah diverifikasi
+		userData["password"] = "sso_user_no_password_" + req.KeycloakID
 
 		// Create user di Supabase
 		userJSON, _ := json.Marshal(userData)
@@ -5013,14 +4190,14 @@ func createSession(userID interface{}, r *http.Request) (sessionID string, err e
 }
 
 // Page rendering functions
-func renderLoginPage(w http.ResponseWriter, errorMsg, email string) {
+func renderLoginPage(w http.ResponseWriter, errorMsg, _ string) {
 	logoBase64 := base64.StdEncoding.EncodeToString(LogoData)
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html lang="id">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login - Dinas Pendidikan DKI Jakarta</title>
+    <title>Login SSO - Dinas Pendidikan DKI Jakarta</title>
     <link rel="icon" type="image/png" href="/logo.png">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -5040,13 +4217,13 @@ func renderLoginPage(w http.ResponseWriter, errorMsg, email string) {
             width: 100%%;
             max-width: 420px;
             padding: 40px;
+            text-align: center;
         }
         .logo {
-            text-align: center;
             margin-bottom: 32px;
         }
         .logo img {
-            height: 48px;
+            height: 64px;
             margin-bottom: 16px;
         }
         .logo h1 {
@@ -5059,101 +4236,46 @@ func renderLoginPage(w http.ResponseWriter, errorMsg, email string) {
             color: #64748b;
             font-size: 14px;
         }
-        .form-group {
-            margin-bottom: 20px;
+        .sso-info {
+            background: #f0f4ff;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 24px;
         }
-        .form-group label {
-            display: block;
-            color: #334155;
+        .sso-info p {
+            color: #4f46e5;
             font-size: 14px;
-            font-weight: 500;
-            margin-bottom: 8px;
-        }
-        .input-wrapper {
-            position: relative;
-        }
-        .form-group input {
-            width: 100%%;
-            padding: 12px 16px;
-            padding-right: 45px;
-            border: 2px solid #e2e8f0;
-            border-radius: 8px;
-            font-size: 15px;
-            transition: all 0.2s;
-            background: #f8fafc;
-        }
-        .form-group input:focus {
-            outline: none;
-            border-color: #6366f1;
-            background: white;
-        }
-        .password-toggle {
-            position: absolute;
-            right: 12px;
-            top: 50%%;
-            transform: translateY(-50%%);
-            background: none;
-            border: none;
-            cursor: pointer;
-            color: #64748b;
-            font-size: 18px;
-            padding: 4px;
-        }
-        .password-toggle:hover {
-            color: #334155;
-        }
-        .password-toggle svg {
-            width: 18px;
-            height: 18px;
-            pointer-events: none;
-        }
-        .btn-primary {
-            width: 100%%;
-            padding: 14px;
-            background: #6366f1;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s;
-            margin-top: 8px;
-        }
-        .btn-primary:hover {
-            background: #4f46e5;
+            line-height: 1.6;
         }
         .btn-sso {
             width: 100%%;
-            padding: 14px;
+            padding: 16px 24px;
             background: linear-gradient(135deg, #4f46e5 0%%, #4338ca 100%%);
             color: white;
             border: none;
-            border-radius: 8px;
-            font-size: 16px;
+            border-radius: 12px;
+            font-size: 18px;
             font-weight: 600;
             cursor: pointer;
             transition: all 0.3s ease;
-            margin-top: 16px;
             display: flex;
             align-items: center;
             justify-content: center;
             text-decoration: none;
-            box-shadow: 0 4px 6px -1px rgba(79, 70, 229, 0.2), 0 2px 4px -1px rgba(79, 70, 229, 0.1);
+            box-shadow: 0 4px 15px rgba(79, 70, 229, 0.4);
         }
         .btn-sso:hover {
             background: linear-gradient(135deg, #4338ca 0%%, #3730a3 100%%);
             transform: translateY(-2px);
-            box-shadow: 0 10px 15px -3px rgba(79, 70, 229, 0.3);
+            box-shadow: 0 8px 25px rgba(79, 70, 229, 0.5);
+        }
+        .btn-sso:active {
+            transform: translateY(0);
         }
         .btn-sso svg {
-            width: 20px;
-            height: 20px;
-            margin-right: 10px;
-        }
-        .btn-primary:disabled {
-            background: #94a3b8;
-            cursor: not-allowed;
+            width: 24px;
+            height: 24px;
+            margin-right: 12px;
         }
         .error-popup {
             position: fixed;
@@ -5176,19 +4298,10 @@ func renderLoginPage(w http.ResponseWriter, errorMsg, email string) {
             from { transform: translateX(400px); opacity: 0; }
             to { transform: translateX(0); opacity: 1; }
         }
-        .link-text {
-            text-align: center;
+        .footer-text {
             margin-top: 24px;
-            color: #64748b;
-            font-size: 14px;
-        }
-        .link-text a {
-            color: #6366f1;
-            text-decoration: none;
-            font-weight: 500;
-        }
-        .link-text a:hover {
-            text-decoration: underline;
+            color: #94a3b8;
+            font-size: 12px;
         }
     </style>
 </head>
@@ -5199,417 +4312,28 @@ func renderLoginPage(w http.ResponseWriter, errorMsg, email string) {
             <h1>Dinas Pendidikan</h1>
             <p>Provinsi DKI Jakarta</p>
         </div>
-        <form id="loginForm" method="POST" action="/login">
-            <div class="form-group">
-                <label for="email">Email</label>
-                <input type="email" id="email" name="email" required value="%s" autocomplete="email">
-            </div>
-            <div class="form-group">
-                <label for="password">Password</label>
-                <div class="input-wrapper">
-                    <input type="password" id="password" name="password" required autocomplete="current-password">
-                    <button type="button" class="password-toggle" onclick="togglePassword('password')">
-                        <svg class="eye-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                        </svg>
-                        <svg class="eye-off-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" style="display: none;">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
-                        </svg>
-                    </button>
-                </div>
-            </div>
-            <button type="submit" class="btn-primary" id="submitBtn">Masuk</button>
-        </form>
         
-        <div style="text-align: center; margin: 20px 0; position: relative;">
-            <hr style="border: 0; border-top: 1px solid #e2e8f0;">
-            <span style="position: absolute; top: -10px; left: 50%; transform: translateX(-50%); background: white; padding: 0 10px; color: #64748b; font-size: 14px;">atau</span>
+        <div class="sso-info">
+            <p>Silakan login menggunakan akun SSO Dinas Pendidikan Anda untuk mengakses sistem.</p>
         </div>
 
-        <a href="/sso/login" class="btn-sso">
+        <a href="/sso/login" class="btn-sso" id="ssoLoginBtn">
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
             </svg>
             Login dengan SSO
         </a>
-        <div class="link-text">
-            Belum punya akun? <a href="/register">Daftar di sini</a>
-        </div>
+        
+        <p class="footer-text">Single Sign-On (SSO) powered by Keycloak</p>
     </div>
     <div class="error-popup" id="errorPopup"></div>
     <script>
-        function togglePassword(inputId) {
-            const input = document.getElementById(inputId);
-            const button = input.nextElementSibling;
-            const eyeIcon = button.querySelector('.eye-icon');
-            const eyeOffIcon = button.querySelector('.eye-off-icon');
-            if (input.type === 'password') {
-                input.type = 'text';
-                eyeIcon.style.display = 'none';
-                eyeOffIcon.style.display = 'block';
-            } else {
-                input.type = 'password';
-                eyeIcon.style.display = 'block';
-                eyeOffIcon.style.display = 'none';
-            }
-        }
         function showError(message) {
             const popup = document.getElementById('errorPopup');
             popup.textContent = message;
             popup.classList.add('show');
             setTimeout(() => popup.classList.remove('show'), 5000);
         }
-        document.getElementById('loginForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const btn = document.getElementById('submitBtn');
-            const originalText = btn.textContent;
-            btn.disabled = true;
-            btn.textContent = 'Memproses...';
-            const formData = {
-                email: document.getElementById('email').value.trim(),
-                password: document.getElementById('password').value
-            };
-            if (!formData.email || !formData.password) {
-                showError('Email dan password harus diisi');
-                btn.disabled = false;
-                btn.textContent = originalText;
-                return;
-            }
-            try {
-                const res = await fetch('/api/login', {
-                    method: 'POST',
-                    headers: { 
-                        'Content-Type': 'application/json',
-                        'Accept': 'application/json'
-                    },
-                    body: JSON.stringify(formData)
-                });
-                
-                // Cek status code
-                if (!res.ok) {
-                    const errorData = await res.json().catch(() => ({ error: 'Login gagal' }));
-                    showError(errorData.error || 'Login gagal');
-                    btn.disabled = false;
-                    btn.textContent = originalText;
-                    return;
-                }
-                
-                const data = await res.json();
-                if (data.success) {
-                    // Redirect ke dashboard atau redirect URL dari server
-                    const redirectUrl = data.redirect || '/dashboard';
-                    window.location.href = redirectUrl;
-                } else {
-                    showError(data.error || 'Login gagal');
-                    btn.disabled = false;
-                    btn.textContent = originalText;
-                }
-            } catch (error) {
-                console.error('Login error:', error);
-                showError('Terjadi kesalahan. Silakan coba lagi.');
-                btn.disabled = false;
-                btn.textContent = originalText;
-            }
-        });
-        %s
-    </script>
-    <!-- SSO Keycloak Handler -->
-    <script src="/static/sso-handler.js"></script>
-</body>
-</html>`, logoBase64, email, func() string {
-		if errorMsg != "" {
-			return fmt.Sprintf("showError('%s');", strings.ReplaceAll(errorMsg, "'", "\\'"))
-		}
-		return ""
-	}())
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(html))
-}
-
-func renderRegisterPage(w http.ResponseWriter, errorMsg string) {
-	logoBase64 := base64.StdEncoding.EncodeToString(LogoData)
-	html := fmt.Sprintf(`<!DOCTYPE html>
-<html lang="id">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daftar - Dinas Pendidikan DKI Jakarta</title>
-    <link rel="icon" type="image/png" href="/logo.png">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }
-        .register-container {
-            background: white;
-            border-radius: 16px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            width: 100%%;
-            max-width: 480px;
-            padding: 40px;
-            max-height: 90vh;
-            overflow-y: auto;
-        }
-        .logo {
-            text-align: center;
-            margin-bottom: 32px;
-        }
-        .logo img {
-            height: 48px;
-            margin-bottom: 16px;
-        }
-        .logo h1 {
-            color: #1e293b;
-            font-size: 24px;
-            font-weight: 600;
-            margin-bottom: 8px;
-        }
-        .logo p {
-            color: #64748b;
-            font-size: 14px;
-        }
-        .form-group {
-            margin-bottom: 20px;
-        }
-        .form-group label {
-            display: block;
-            color: #334155;
-            font-size: 14px;
-            font-weight: 500;
-            margin-bottom: 8px;
-        }
-        .input-wrapper {
-            position: relative;
-        }
-        .form-group input,
-        .form-group select {
-            width: 100%%;
-            padding: 12px 16px;
-            border: 2px solid #e2e8f0;
-            border-radius: 8px;
-            font-size: 15px;
-            transition: all 0.2s;
-            background: #f8fafc;
-        }
-        .form-group input[type="password"] {
-            padding-right: 45px;
-        }
-        .form-group input:focus,
-        .form-group select:focus {
-            outline: none;
-            border-color: #6366f1;
-            background: white;
-        }
-        .password-toggle {
-            position: absolute;
-            right: 12px;
-            top: 50%%;
-            transform: translateY(-50%%);
-            background: none;
-            border: none;
-            cursor: pointer;
-            color: #64748b;
-            font-size: 18px;
-            padding: 4px;
-        }
-        .password-toggle:hover {
-            color: #334155;
-        }
-        .password-toggle svg {
-            width: 18px;
-            height: 18px;
-            pointer-events: none;
-        }
-        .btn-primary {
-            width: 100%%;
-            padding: 14px;
-            background: #6366f1;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s;
-            margin-top: 8px;
-        }
-        .btn-primary:hover {
-            background: #4f46e5;
-        }
-        .btn-primary:disabled {
-            background: #94a3b8;
-            cursor: not-allowed;
-        }
-        .error-popup {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            background: #dc2626;
-            color: white;
-            padding: 16px 20px;
-            border-radius: 8px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-            display: none;
-            z-index: 1000;
-            max-width: 400px;
-        }
-        .error-popup.show {
-            display: block;
-            animation: slideIn 0.3s ease;
-        }
-        @keyframes slideIn {
-            from { transform: translateX(400px); opacity: 0; }
-            to { transform: translateX(0); opacity: 1; }
-        }
-        .link-text {
-            text-align: center;
-            margin-top: 24px;
-            color: #64748b;
-            font-size: 14px;
-        }
-        .link-text a {
-            color: #6366f1;
-            text-decoration: none;
-            font-weight: 500;
-        }
-        .link-text a:hover {
-            text-decoration: underline;
-        }
-    </style>
-</head>
-<body>
-    <div class="register-container">
-        <div class="logo">
-            <img src="data:image/png;base64,%s" alt="Logo Dinas Pendidikan">
-            <h1>Daftar Akun</h1>
-            <p>Dinas Pendidikan DKI Jakarta</p>
-        </div>
-        <form id="registerForm">
-            <div class="form-group">
-                <label for="nama_lengkap">Nama Lengkap</label>
-                <input type="text" id="nama_lengkap" name="nama_lengkap" required autocomplete="name">
-            </div>
-            <div class="form-group">
-                <label for="email">Email</label>
-                <input type="email" id="email" name="email" required autocomplete="email">
-            </div>
-            <div class="form-group">
-                <label for="peran">Peran</label>
-                <select id="peran" name="peran" required>
-                    <option value="">Pilih Peran</option>
-                    <option value="guru">Guru</option>
-                    <option value="wali">Wali Murid</option>
-                    <option value="murid">Murid</option>
-                    <option value="user">User Umum</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label for="password">Password</label>
-                <div class="input-wrapper">
-                    <input type="password" id="password" name="password" required autocomplete="new-password">
-                    <button type="button" class="password-toggle" onclick="togglePassword('password')">
-                        <svg class="eye-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                        </svg>
-                        <svg class="eye-off-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" style="display: none;">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
-                        </svg>
-                    </button>
-                </div>
-            </div>
-            <button type="submit" class="btn-primary" id="submitBtn">Daftar</button>
-        </form>
-        <div class="link-text">
-            Sudah punya akun? <a href="/login">Masuk di sini</a>
-        </div>
-    </div>
-    <div class="error-popup" id="errorPopup"></div>
-    <script>
-        function togglePassword(inputId) {
-            const input = document.getElementById(inputId);
-            const button = input.nextElementSibling;
-            const eyeIcon = button.querySelector('.eye-icon');
-            const eyeOffIcon = button.querySelector('.eye-off-icon');
-            if (input.type === 'password') {
-                input.type = 'text';
-                eyeIcon.style.display = 'none';
-                eyeOffIcon.style.display = 'block';
-            } else {
-                input.type = 'password';
-                eyeIcon.style.display = 'block';
-                eyeOffIcon.style.display = 'none';
-            }
-        }
-        function showError(message) {
-            const popup = document.getElementById('errorPopup');
-            popup.textContent = message;
-            popup.classList.add('show');
-            setTimeout(() => popup.classList.remove('show'), 5000);
-        }
-        document.getElementById('registerForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const btn = document.getElementById('submitBtn');
-            const originalText = btn.textContent;
-            btn.disabled = true;
-            btn.textContent = 'Memproses...';
-            const formData = {
-                nama_lengkap: document.getElementById('nama_lengkap').value.trim(),
-                email: document.getElementById('email').value.trim(),
-                peran: document.getElementById('peran').value,
-                password: document.getElementById('password').value
-            };
-            if (!formData.nama_lengkap || !formData.email || !formData.peran || !formData.password) {
-                showError('Semua field harus diisi');
-                btn.disabled = false;
-                btn.textContent = originalText;
-                return;
-            }
-            if (formData.password.length < 6) {
-                showError('Password minimal 6 karakter');
-                btn.disabled = false;
-                btn.textContent = originalText;
-                return;
-            }
-            try {
-                const res = await fetch('/api/register', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(formData)
-                });
-                
-                // Cek status code
-                if (!res.ok) {
-                    const errorData = await res.json().catch(() => ({ error: 'Registrasi gagal' }));
-                    showError(errorData.error || 'Registrasi gagal');
-                    btn.disabled = false;
-                    btn.textContent = originalText;
-                    return;
-                }
-                
-                const data = await res.json();
-                if (data.success) {
-                    // Redirect to home page after successful registration
-                    window.location.href = data.redirect || '/';
-                } else {
-                    showError(data.error || 'Registrasi gagal');
-                    btn.disabled = false;
-                    btn.textContent = originalText;
-                }
-            } catch (error) {
-                console.error('Register error:', error);
-                showError('Terjadi kesalahan. Silakan coba lagi.');
-                btn.disabled = false;
-                btn.textContent = originalText;
-            }
-        });
         %s
     </script>
 </body>
@@ -5622,6 +4346,8 @@ func renderRegisterPage(w http.ResponseWriter, errorMsg string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(html))
 }
+
+// renderRegisterPage telah dihapus - Registrasi dilakukan melalui SSO Keycloak
 
 func getCommonHeader(user map[string]interface{}) string {
 	logoBase64 := base64.StdEncoding.EncodeToString(LogoData)
