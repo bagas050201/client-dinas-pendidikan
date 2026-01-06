@@ -7,13 +7,16 @@ package main
 // Dapat di-copy dan digunakan oleh website client lain.
 //
 // CARA PENGGUNAAN:
-// 1. Copy file ini ke project Anda
-// 2. Set environment variables (lihat section Configuration)
-// 3. Panggil fungsi yang tersedia dari handler Anda
+// 1. Copy file ini ke project Anda (misal ke folder pkg/sso/)
+// 2. Sesuaikan nama package (misal: package sso)
+// 3. Set environment variables:
+//    - KEYCLOAK_BASE_URL, KEYCLOAK_REALM, KEYCLOAK_CLIENT_ID, KEYCLOAK_REDIRECT_URI
+// 4. Panggil RedirectToKeycloakLogin() di handler login Anda
+// 5. Panggil HandleOAuthCallback() di handler callback Anda
 //
 // FLOW SSO:
-// [User] -> [Login Button] -> RedirectToKeycloak() -> [Keycloak Login]
-//        <- [Dashboard]    <- HandleCallback()     <- [Callback URL]
+// [User] -> [Login Button] -> RedirectToKeycloakLogin() -> [Keycloak Login]
+//        <- [Dashboard]    <- HandleOAuthCallback()     <- [Callback URL]
 // ===============================================================================
 
 import (

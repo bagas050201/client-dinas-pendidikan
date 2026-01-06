@@ -9,13 +9,14 @@ Panduan **copy-paste ready** untuk mengintegrasikan Single Sign-On (SSO) Keycloa
 1. [Quickstart (5 Menit)](#quickstart-5-menit)
 2. [Konsep SSO](#konsep-sso)
 3. [Environment Variables](#environment-variables)
-4. [Implementasi Go (Golang)](#implementasi-go-golang)
+4. [Implementasi Go (Golang) - Menggunakan Helper Kami](#implementasi-go-golang---menggunakan-helper-kami)
 5. [Implementasi JavaScript (Browser)](#implementasi-javascript-browser)
-6. [Implementasi PHP (Laravel)](#implementasi-php-laravel)
-7. [Implementasi Python (Flask)](#implementasi-python-flask)
-8. [Implementasi Node.js (Express)](#implementasi-nodejs-express)
-9. [Session Management](#session-management)
-10. [Troubleshooting](#troubleshooting)
+6. [Integrasi Database JAKEDU (Optional)](#integrasi-database-jakedu-optional)
+7. [Implementasi PHP (Laravel)](#implementasi-php-laravel)
+8. [Implementasi Python (Flask)](#implementasi-python-flask)
+9. [Implementasi Node.js (Express)](#implementasi-nodejs-express)
+10. [Session Management](#session-management)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -143,9 +144,85 @@ KEYCLOAK_CLIENT_SECRET=your-secret
 
 ---
 
-## Implementasi Go (Golang)
+## Implementasi Go (Golang) - Menggunakan Helper Kami
 
-### File Lengkap: `sso/keycloak.go`
+Cara termudah untuk implementasi di project Go lain adalah dengan meng-copy file `api/keycloak_helpers.go` dari repository ini.
+
+### Langkah 1: Copy Helper
+Copy file `api/keycloak_helpers.go` ke folder project Anda (misal ke folder `pkg/sso/`).
+
+### Langkah 2: Konfigurasi Environment
+Pastikan environment variables berikut sudah di-set:
+
+```bash
+KEYCLOAK_BASE_URL=https://sso.jakedu.id
+KEYCLOAK_REALM=dinas-pendidikan
+KEYCLOAK_CLIENT_ID=your-client-id
+KEYCLOAK_REDIRECT_URI=http://localhost:8070/callback
+```
+
+### Langkah 3: Gunakan di Handler Anda
+
+Ada 3 fungsi utama yang perlu Anda panggil di codingan Anda:
+
+**1. Handler Login (Mengarahkan User ke Keycloak)**
+Gunakan fungsi `RedirectToKeycloakLogin`. Fungsi ini akan membuatkan URL login yang aman dan mengarahkan browser user ke halaman login Keycloak.
+
+```go
+func LoginHandler(w http.ResponseWriter, r *http.Request) {
+    // Parameter:
+    // - w, r: standard http parameter
+    // - silentCheck: 
+    //    - false: Tampilkan form login (Gunakan ini untuk tombol "Login")
+    //    - true: Cek login diam-diam (Gunakan ini untuk auto-login di background)
+    RedirectToKeycloakLogin(w, r, false)
+}
+```
+
+**2. Handler Callback (Memproses Hasil Login)**
+Gunakan fungsi `HandleOAuthCallback`. Ini adalah "fungsi sakti" yang melakukan segalanya secara otomatis: validasi keamanan, menukar kode dengan token, mengambil data user, dan membuatkan session login di website Anda.
+
+```go
+func CallbackHandler(w http.ResponseWriter, r *http.Request) {
+    // Cukup panggil fungsi ini, dia akan mengurus semuanya
+    // dan otomatis redirect user ke /dashboard jika berhasil.
+    HandleOAuthCallback(w, r)
+}
+```
+
+**3. Handler Logout (Keluar dari Sistem)**
+Gunakan fungsi `redirectToKeycloakLogout`. Fungsi ini akan menghapus session di website Anda dan juga memberitahu Keycloak bahwa user sudah keluar.
+
+```go
+func LogoutHandler(w http.ResponseWriter, r *http.Request) {
+    // Ambil ID Token dari cookie (disimpan otomatis oleh helper saat login)
+    idToken, _ := helpers.GetCookie(r, "sso_id_token")
+    
+    // URL tujuan setelah logout berhasil
+    redirectURI := "http://localhost:8070/login"
+    
+    // Panggil helper untuk proses logout ke Keycloak
+    redirectToKeycloakLogout(w, r, idToken, redirectURI)
+}
+```
+
+### Ringkasan Fungsi yang Tersedia
+
+| Nama Fungsi | Kegunaan | Kapan Dipanggil? |
+|-------------|----------|------------------|
+| `RedirectToKeycloakLogin` | Memulai proses login | Saat user klik tombol "Login" |
+| `HandleOAuthCallback` | Memproses data setelah user login | Di endpoint `/callback` |
+| `redirectToKeycloakLogout` | Keluar dari akun | Saat user klik tombol "Logout" |
+| `ParseIDToken` | Mengambil data user (Nama, Email) | Jika Anda ingin baca data user dari token secara manual |
+| `ValidateAccessToken` | Cek apakah login masih aktif | Untuk proteksi halaman (Middleware) |
+
+---
+
+## Implementasi Go (Manual)
+
+Jika Anda ingin menulis implementasi sendiri, berikut adalah struktur kodenya:
+
+### File: `sso/keycloak.go`
 
 ```go
 package sso
@@ -527,6 +604,33 @@ if (window.location.pathname === '/callback') {
         })
         .catch(err => console.error(err));
 }
+```
+
+```
+
+---
+
+## Integrasi Database JAKEDU (Optional)
+
+Jika website Anda membutuhkan data tambahan dari database JAKEDU (seperti NRK, Unit Kerja, dll), Anda dapat menggunakan koneksi PostgreSQL langsung.
+
+### 1. Environment Variables
+```bash
+JAKEDU_PG_HOST=10.40.69.10
+JAKEDU_PG_PORT=5434
+JAKEDU_PG_DB=jakedu_dwh
+JAKEDU_PG_USER=your_user
+JAKEDU_PG_PASSWORD=your_password
+```
+
+### 2. Query User by Email/SSO Sub
+Gunakan email dari SSO untuk mencari data user di database JAKEDU:
+
+```sql
+SELECT id, email, fullname, nrk, unit_kerja 
+FROM account.za_users 
+WHERE email = $1 OR nickname = $1
+LIMIT 1;
 ```
 
 ---

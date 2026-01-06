@@ -17,7 +17,7 @@ Aplikasi ini **hanya mendukung SSO Keycloak**. Tidak ada login email/password tr
 
 - **Backend**: Go (Golang)
 - **SSO**: Keycloak dengan OAuth 2.0 / OIDC + PKCE
-- **Database**: PostgreSQL (via Supabase untuk session storage)
+- **Database**: PostgreSQL (JAKEDU External DB - Read Only)
 - **Deployment**: Vercel Serverless Functions
 
 ## 📁 Struktur Folder
@@ -25,15 +25,15 @@ Aplikasi ini **hanya mendukung SSO Keycloak**. Tidak ada login email/password tr
 ```
 client-dinas-pendidikan/
 ├── api/                          # Vercel serverless functions
-│   ├── main_handler.go           # Core routing dan handlers (4700+ lines)
-│   ├── keycloak_helpers.go       # Helper SSO Keycloak (modular, copy-paste ready)
+│   ├── main_handler.go           # Core routing dan handlers
+│   ├── keycloak_helpers.go       # Helper SSO Keycloak
 │   ├── profile_handler.go        # Handler halaman profile
 │   ├── logo.png                  # Logo (embedded)
 │   └── static/
 │       └── sso-handler.js        # SSO JavaScript handler
 │
 ├── docs/                         # Dokumentasi
-│   └── SSO_INTEGRATION_GUIDE.md  # 📚 Panduan integrasi SSO (Go, JS, PHP, Python, Node.js)
+│   └── SSO_INTEGRATION_GUIDE.md  # 📚 Panduan integrasi SSO
 │
 ├── pkg/helpers/                  # Utility functions
 │   └── utils.go
@@ -45,35 +45,12 @@ client-dinas-pendidikan/
 └── vercel.json                   # Vercel config
 ```
 
-## 📚 Untuk Developer Website Client Lain
-
-Jika Anda ingin mengintegrasikan SSO Keycloak ke website client Anda:
-
-👉 **Baca: [docs/SSO_INTEGRATION_GUIDE.md](docs/SSO_INTEGRATION_GUIDE.md)**
-
-Panduan mencakup:
-- ✅ **Quickstart** - Integrasi dalam 5 menit
-- ✅ **Konsep SSO & PKCE** - Penjelasan visual dengan diagram
-- ✅ **Go (Golang)** - Full code siap copy-paste
-- ✅ **JavaScript (Browser)** - Class SSOClient
-- ✅ **PHP (Laravel)** - Service & Controller
-- ✅ **Python (Flask)** - Module & routes
-- ✅ **Node.js (Express)** - Full implementation
-- ✅ **Troubleshooting** - Error umum dan solusi
-
-### File Referensi
-
-| File | Deskripsi |
-|------|-----------|
-| `api/keycloak_helpers.go` | Helper SSO yang bisa di-copy ke project Go lain |
-| `docs/SSO_INTEGRATION_GUIDE.md` | Panduan lengkap untuk semua bahasa |
-
 ## Setup
 
 ### Prerequisites
 - Go 1.20+
 - Keycloak Server yang sudah dikonfigurasi
-- PostgreSQL database
+- Akses ke database JAKEDU PostgreSQL
 
 ### Environment Variables
 
@@ -81,21 +58,17 @@ Buat file `.env`:
 
 ```bash
 # SSO Keycloak Configuration
-KEYCLOAK_BASE_URL=http://localhost:8080
+KEYCLOAK_BASE_URL=https://sso.jakedu.id
 KEYCLOAK_REALM=dinas-pendidikan
 KEYCLOAK_CLIENT_ID=client-dinas
 KEYCLOAK_REDIRECT_URI=http://localhost:8070/callback
 
-# PostgreSQL Configuration
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5433
-POSTGRES_DB=dinas_pendidikan
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=postgres123
-
-# Supabase (untuk session storage)
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_KEY=your-anon-key
+# JAKEDU External DB (Read Only)
+JAKEDU_PG_HOST=10.40.69.10
+JAKEDU_PG_PORT=5434
+JAKEDU_PG_DB=jakedu_dwh
+JAKEDU_PG_USER=reader_dwh
+JAKEDU_PG_PASSWORD=password
 
 # Server
 PORT=8070
