@@ -183,7 +183,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("🕵️ Performing Silent SSO Check (prompt=none)...")
 		redirectToKeycloakLogin(w, r, true) // true = dengan prompt=none
 
-	case "/login-manual":
+	case "/login-manual", "/sso/login":
 		// Endpoint untuk login manual (jika silent check gagal)
 		// Redirect ke Keycloak TANPA prompt=none (tampilkan form login)
 		log.Printf("👤 Performing Manual Login (Standard SSO)...")
@@ -195,9 +195,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	case "/dashboard":
 		DashboardHandler(w, r)
 		return
-	case "/profile":
-		ProfileHandler(w, r)
-		return
+
 	case "/logout":
 		LogoutHandler(w, r)
 		return
@@ -249,7 +247,21 @@ func getMapKeys(m map[string]interface{}) []string {
 // Jika tidak, tampilkan form login
 func LoginPageHandler(w http.ResponseWriter, r *http.Request) {
 	// Cek apakah user sudah login (cek access token atau session)
-	if isAuthenticated(r) {
+	// Cek apakah ada error parameter (khususnya login_required)
+	errorParam := r.URL.Query().Get("error")
+
+	// Jika error adalah login_required, kita harus paksa clear session dan JANGAN redirect ke dashboard
+	// Ini untuk memutus infinite loop jika browser masih mengirim cookie lama
+	if errorParam == "login_required" || errorParam == "interaction_required" {
+		log.Printf("ℹ️ Forced logout due to %s, clearing cookies and showing login form", errorParam)
+		helpers.ClearCookie(w, r, "client_dinas_session")
+		helpers.ClearCookie(w, r, "sso_access_token")
+		helpers.ClearCookie(w, r, "sso_id_token")
+		helpers.ClearCookie(w, r, "sso_token_expires")
+		helpers.ClearCookie(w, r, "session_id")
+		// Lanjut ke renderLoginPage di bawah, jangan return
+	} else if isAuthenticated(r) {
+		// Jika tidak ada error login_required, baru cek apakah user sudah login
 		log.Printf("✅ User already logged in, redirecting to dashboard")
 		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
 		return
@@ -1047,10 +1059,7 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, sso
         </div>
 
         <div class="actions-grid">
-            <a href="/profile" class="action-card">
-                <div class="action-title">👤 Profil Saya</div>
-                <div class="action-desc">Lihat informasi profil akun Anda</div>
-            </a>
+
             <a href="/logout" class="action-card" style="background: linear-gradient(135deg, #ef4444 0%%, #dc2626 100%%); color: white;">
                 <div class="action-title">🚪 Logout</div>
                 <div class="action-desc">Keluar dari sistem SSO</div>
@@ -1510,6 +1519,21 @@ func SSOCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	// Handle error dari SSO
 	if errorParam != "" {
 		log.Printf("ERROR from SSO: %s - %s", errorParam, errorDescription)
+
+		// Jika error adalah login_required (dari silent check), kita harus clear session lokal
+		// supaya user tidak dianggap "sudah login" oleh LoginPageHandler
+		if errorParam == "login_required" || errorParam == "interaction_required" {
+			log.Printf("🔄 Silent SSO failed (login_required), clearing local session and redirecting to login")
+			helpers.ClearCookie(w, r, "client_dinas_session")
+			helpers.ClearCookie(w, r, "sso_access_token")
+			helpers.ClearCookie(w, r, "sso_id_token")
+			helpers.ClearCookie(w, r, "sso_token_expires")
+			helpers.ClearCookie(w, r, "session_id")
+			
+			http.Redirect(w, r, "/login?error=login_required", http.StatusSeeOther)
+			return
+		}
+
 		http.Redirect(w, r, "/login?error=sso_error&message="+url.QueryEscape(errorDescription), http.StatusSeeOther)
 		return
 	}

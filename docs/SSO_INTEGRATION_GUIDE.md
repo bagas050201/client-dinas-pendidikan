@@ -133,7 +133,7 @@ userInfo := parseIDToken(token.IDToken)
 
 ```bash
 # Wajib
-KEYCLOAK_BASE_URL=http://localhost:8080     # URL Keycloak Server
+KEYCLOAK_BASE_URL=http://10.40.69.51:8080     # URL Keycloak Staging (Wajib VPN/SSH Tunnel)
 KEYCLOAK_REALM=dinas-pendidikan             # Nama Realm
 KEYCLOAK_CLIENT_ID=your-app-client          # Client ID
 KEYCLOAK_REDIRECT_URI=http://localhost:8070/callback  # Callback URL
@@ -152,10 +152,10 @@ Cara termudah untuk implementasi di project Go lain adalah dengan meng-copy file
 Copy file `api/keycloak_helpers.go` ke folder project Anda (misal ke folder `pkg/sso/`).
 
 ### Langkah 2: Konfigurasi Environment
-Pastikan environment variables berikut sudah di-set:
+Pastikan environment variables berikut sudah di-set (Gunakan IP Staging):
 
 ```bash
-KEYCLOAK_BASE_URL=https://sso.jakedu.id
+KEYCLOAK_BASE_URL=http://10.40.69.51:8080
 KEYCLOAK_REALM=dinas-pendidikan
 KEYCLOAK_CLIENT_ID=your-client-id
 KEYCLOAK_REDIRECT_URI=http://localhost:8070/callback
@@ -215,6 +215,16 @@ func LogoutHandler(w http.ResponseWriter, r *http.Request) {
 | `redirectToKeycloakLogout` | Keluar dari akun | Saat user klik tombol "Logout" |
 | `ParseIDToken` | Mengambil data user (Nama, Email) | Jika Anda ingin baca data user dari token secara manual |
 | `ValidateAccessToken` | Cek apakah login masih aktif | Untuk proteksi halaman (Middleware) |
+
+### Penting: Menangani Infinite Loop (Silent Check)
+
+Saat menggunakan `prompt=none` (Silent Check), Keycloak mungkin mengembalikan error `login_required` jika user belum login. Sangat penting untuk menangani ini di **Callback Handler** dan **Login Page Handler** untuk mencegah infinite loop.
+
+**Di Callback Handler:**
+Jika menerima error `login_required`, **HAPUS** semua session lokal dan redirect ke halaman login biasa.
+
+**Di Login Page Handler:**
+Jika URL mengandung `error=login_required`, **HAPUS** semua session lokal dan jangan redirect otomatis ke dashboard.
 
 ---
 
@@ -394,17 +404,38 @@ import (
     "your-app/sso"
 )
 
-// LoginHandler - Mulai SSO flow
+// LoginPageHandler - Menampilkan halaman login
+func LoginPageHandler(w http.ResponseWriter, r *http.Request) {
+    // 1. Cek Error Infinite Loop (PENTING!)
+    // Jika ada error login_required, berarti silent check gagal.
+    // Kita harus paksa logout (hapus cookie) dan jangan redirect ke dashboard.
+    if r.URL.Query().Get("error") == "login_required" {
+        http.SetCookie(w, &http.Cookie{Name: "session_id", MaxAge: -1})
+        // Tampilkan form login...
+        return
+    }
+
+    // 2. Cek jika user sudah login
+    if _, err := r.Cookie("session_id"); err == nil {
+        http.Redirect(w, r, "/dashboard", http.StatusFound)
+        return
+    }
+
+    // 3. Tampilkan HTML Login
+    // ...
+}
+
+// LoginHandler - Mulai SSO flow (Action)
 func LoginHandler(w http.ResponseWriter, r *http.Request) {
     // 1. Generate PKCE
     pkce, _ := sso.GeneratePKCE()
     
     // 2. Generate state
-    state := generateRandomString(32)
+    state, _ := sso.GenerateRandomString(32)
     
     // 3. Simpan di cookie
-    http.SetCookie(w, &http.Cookie{Name: "pkce_verifier", Value: pkce.Verifier, MaxAge: 300})
-    http.SetCookie(w, &http.Cookie{Name: "oauth_state", Value: state, MaxAge: 300})
+    http.SetCookie(w, &http.Cookie{Name: "pkce_verifier", Value: pkce.Verifier, MaxAge: 300, HttpOnly: true})
+    http.SetCookie(w, &http.Cookie{Name: "oauth_state", Value: state, MaxAge: 300, HttpOnly: true})
     
     // 4. Redirect ke Keycloak
     authURL := sso.GetAuthURL(state, pkce.Challenge)
@@ -413,6 +444,15 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 
 // CallbackHandler - Handle callback dari Keycloak
 func CallbackHandler(w http.ResponseWriter, r *http.Request) {
+    // 0. Cek Error dari SSO (PENTING!)
+    errorParam := r.URL.Query().Get("error")
+    if errorParam == "login_required" || errorParam == "interaction_required" {
+        // Silent check gagal, hapus session dan redirect ke login
+        http.SetCookie(w, &http.Cookie{Name: "session_id", MaxAge: -1})
+        http.Redirect(w, r, "/login?error=login_required", http.StatusFound)
+        return
+    }
+
     // 1. Validasi state
     stateCookie, _ := r.Cookie("oauth_state")
     if r.URL.Query().Get("state") != stateCookie.Value {
@@ -440,8 +480,8 @@ func CallbackHandler(w http.ResponseWriter, r *http.Request) {
     sessionID := createSession(user.Email)
     
     // 7. Set cookies
-    http.SetCookie(w, &http.Cookie{Name: "session_id", Value: sessionID, MaxAge: 86400})
-    http.SetCookie(w, &http.Cookie{Name: "id_token", Value: token.IDToken, MaxAge: 86400})
+    http.SetCookie(w, &http.Cookie{Name: "session_id", Value: sessionID, MaxAge: 86400, HttpOnly: true})
+    http.SetCookie(w, &http.Cookie{Name: "id_token", Value: token.IDToken, MaxAge: 86400, HttpOnly: true})
     
     // 8. Clear PKCE cookies
     http.SetCookie(w, &http.Cookie{Name: "pkce_verifier", MaxAge: -1})
@@ -527,6 +567,19 @@ class SSOClient {
     // Handle callback
     async handleCallback() {
         const params = new URLSearchParams(window.location.search);
+        const error = params.get('error');
+
+        // 1. Cek Error (Silent Check Failed)
+        if (error === 'login_required' || error === 'interaction_required') {
+            // Clear local session
+            localStorage.removeItem('access_token');
+            localStorage.removeItem('id_token');
+            localStorage.removeItem('user');
+            // Redirect ke login
+            window.location.href = '/login';
+            return;
+        }
+
         const code = params.get('code');
         const state = params.get('state');
         
@@ -616,7 +669,7 @@ Jika website Anda membutuhkan data tambahan dari database JAKEDU (seperti NRK, U
 
 ### 1. Environment Variables
 ```bash
-JAKEDU_PG_HOST=10.40.69.10
+JAKEDU_PG_HOST=10.40.69.20
 JAKEDU_PG_PORT=5434
 JAKEDU_PG_DB=jakedu_dwh
 JAKEDU_PG_USER=your_user
