@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -26,65 +25,13 @@ var LogoData []byte
 //go:embed static/sso-handler.js
 var SSOHandlerJS []byte
 
-// PostgreSQL connection functions for JAKEDU External DB
-func getPostgresHost() string {
-	if host := os.Getenv("JAKEDU_PG_HOST"); host != "" {
-		return host
-	}
-	return "10.40.69.20" // default JAKEDU DWH
+var LogoBase64 string
+
+func init() {
+	LogoBase64 = base64.StdEncoding.EncodeToString(LogoData)
 }
 
-func getPostgresPort() string {
-	if port := os.Getenv("JAKEDU_PG_PORT"); port != "" {
-		return port
-	}
-	return "5434" // default JAKEDU port
-}
 
-func getPostgresDB() string {
-	if db := os.Getenv("JAKEDU_PG_DB"); db != "" {
-		return db
-	}
-	return "jakedu_dwh" // default JAKEDU database
-}
-
-func getPostgresUser() string {
-	if user := os.Getenv("JAKEDU_PG_USER"); user != "" {
-		return user
-	}
-	return "reader_dwh" // default JAKEDU user
-}
-
-func getPostgresPassword() string {
-	if password := os.Getenv("JAKEDU_PG_PASSWORD"); password != "" {
-		return password
-	}
-	return "password" // default
-}
-
-// connectPostgreSQL creates a connection to local PostgreSQL database
-func connectPostgreSQL() (*sql.DB, error) {
-	host := getPostgresHost()
-	port := getPostgresPort()
-	dbname := getPostgresDB()
-	user := getPostgresUser()
-	password := getPostgresPassword()
-
-	psqlInfo := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		host, port, user, password, dbname)
-
-	db, err := sql.Open("postgres", psqlInfo)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open PostgreSQL connection: %v", err)
-	}
-
-	err = db.Ping()
-	if err != nil {
-		return nil, fmt.Errorf("failed to ping PostgreSQL database: %v", err)
-	}
-
-	return db, nil
-}
 
 // getSessionSecret returns SESSION_SECRET from environment
 func getSessionSecret() string {
@@ -223,7 +170,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case (path == "/oauth/callback" || path == "/api/callback") && method == "GET":
-		SSOCallbackHandler(w, r)
+		HandleOAuthCallback(w, r)
 	case path == "/api/users/sso-login" && method == "POST":
 		handleSSOUserLoginAPI(w, r)
 	case path == "/api/auth/sso-login" && method == "POST":
@@ -269,7 +216,7 @@ func LoginPageHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Cek apakah user sudah login (cek access token atau session)
 	// PENTING: Jangan redirect jika ada error parameter (untuk menghindari loop)
-	errorParam := r.URL.Query().Get("error")
+	errorParam = r.URL.Query().Get("error")
 	errorMsg := ""
 	messageParam := r.URL.Query().Get("message")
 
@@ -436,12 +383,13 @@ func getUserBySSOIdentifier(identifier string) (map[string]interface{}, error) {
 	// Ambil data user dari PostgreSQL database
 	log.Printf("🔍 getUserBySSOIdentifier: getting user data for identifier: %s", identifier)
 
-	db, err := connectPostgreSQL()
+	db, err := GetDB()
 	if err != nil {
 		log.Printf("❌ getUserBySSOIdentifier: failed to connect to PostgreSQL: %v", err)
 		return nil, fmt.Errorf("failed to connect to PostgreSQL: %v", err)
 	}
-	defer db.Close()
+	// Do NOT close the DB connection here as it is a singleton pool
+	// defer db.Close()
 
 	// Query user from PostgreSQL (Schema Baru: account.za_users)
 	// Kita cari berdasarkan ID, NRK, atau NIK
@@ -665,7 +613,7 @@ func renderDashboardWithToken(w http.ResponseWriter, r *http.Request) {
 
 // renderDashboardPage generates the HTML for the dashboard page.
 func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, ssoClaims map[string]interface{}) {
-	logoBase64 := base64.StdEncoding.EncodeToString(LogoData)
+	logoBase64 := LogoBase64
 
 	userName := ""
 	userEmail := ""
@@ -774,334 +722,26 @@ func renderDashboardPage(w http.ResponseWriter, user map[string]interface{}, sso
 		jsonPayload = string(jsonBytes)
 	}
 
-	html := fmt.Sprintf(`<!DOCTYPE html>
-<html lang="id">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard - Dinas Pendidikan DKI Jakarta</title>
-    <link rel="icon" type="image/png" href="/logo.png">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: #f1f5f9;
-            min-height: 100vh;
-        }
-        .navbar {
-            background: #1e40af;
-            color: white;
-            padding: 16px 24px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        .navbar-left {
-            display: flex;
-            align-items: center;
-            gap: 16px;
-        }
-        .navbar-logo {
-            height: 32px;
-        }
-        .navbar-title {
-            font-size: 18px;
-            font-weight: 600;
-        }
-        .navbar-right {
-            display: flex;
-            align-items: center;
-            gap: 16px;
-        }
-        .user-menu {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            cursor: pointer;
-            padding: 4px 8px;
-            border-radius: 8px;
-            transition: background 0.2s;
-        }
-        .user-menu:hover {
-            background: rgba(255,255,255,0.1);
-        }
-        .user-avatar {
-            width: 32px;
-            height: 32px;
-            border-radius: 50%%;
-            background: #3b82f6;
-            color: white;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: 600;
-            font-size: 14px;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 24px;
-        }
-        .welcome-section {
-            background: linear-gradient(135deg, #3b82f6 0%%, #1e40af 100%%);
-            color: white;
-            border-radius: 12px;
-            padding: 48px;
-            margin-bottom: 32px;
-            text-align: center;
-        }
-        .welcome-title {
-            font-size: 36px;
-            font-weight: 700;
-            margin-bottom: 8px;
-        }
-        .welcome-subtitle {
-            font-size: 18px;
-            opacity: 0.9;
-        }
-        .info-card {
-            background: white;
-            border-radius: 12px;
-            padding: 24px;
-            margin-bottom: 24px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        .info-header {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-bottom: 24px;
-        }
-        .info-title {
-            font-size: 18px;
-            font-weight: 600;
-            color: #1e293b;
-        }
-        .info-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 24px;
-        }
-        .info-item label {
-            display: block;
-            font-size: 12px;
-            font-weight: 600;
-            color: #64748b;
-            margin-bottom: 4px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        .info-item div {
-            font-size: 16px;
-            color: #1e293b;
-            font-weight: 500;
-        }
-        .status-badge {
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 9999px;
-            font-size: 12px;
-            font-weight: 600;
-            background: #dcfce7;
-            color: #166534;
-        }
-        .status-badge.inactive {
-            background: #fee2e2;
-            color: #dc2626;
-        }
-        .role-badge {
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 6px;
-            font-size: 14px;
-            font-weight: 500;
-        }
-        .role-badge.user {
-            background: #e0e7ff;
-            color: #4338ca;
-        }
-        .role-badge.admin {
-            background: #fef3c7;
-            color: #92400e;
-        }
-        .role-badge.inactive {
-            background: #e5e7eb;
-            color: #4b5563;
-        }
-        .json-dump {
-            background: #1e293b;
-            color: #e2e8f0;
-            padding: 16px;
-            border-radius: 8px;
-            font-family: monospace;
-            font-size: 12px;
-            overflow-x: auto;
-            margin-top: 16px;
-            white-space: pre-wrap;
-        }
-        .actions-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 16px;
-        }
-        .action-card {
-            background: white;
-            border-radius: 12px;
-            padding: 24px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-            text-decoration: none;
-            color: inherit;
-            display: block;
-            transition: transform 0.2s, box-shadow 0.2s;
-        }
-        .action-card:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-        }
-        .action-title {
-            font-size: 18px;
-            font-weight: 600;
-            color: #1e293b;
-            margin-bottom: 8px;
-        }
-        .action-desc {
-            color: #64748b;
-            font-size: 14px;
-        }
-        .btn-logout {
-            background: #ef4444;
-            color: white;
-            border: none;
-            padding: 8px 16px;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 500;
-            transition: background 0.2s;
-        }
-        .btn-logout:hover {
-            background: #dc2626;
-        }
-        @media (max-width: 768px) {
-            .container { padding: 16px; }
-            .welcome-section { padding: 24px; }
-        }
-    </style>
-</head>
-<body>
-    <nav class="navbar">
-        <div class="navbar-left">
-            <img src="data:image/png;base64,%s" alt="Logo" class="navbar-logo">
-            <span class="navbar-title">Dinas Pendidikan DKI Jakarta</span>
-        </div>
-        <div class="navbar-right">
-            <div class="user-menu">
-                <div class="user-avatar">%s</div>
-                <span id="headerUserName">%s</span>
-            </div>
-            <a href="/logout" class="btn-logout">Logout</a>
-        </div>
-    </nav>
-    <div class="container">
-        <div class="welcome-section">
-            <h1 class="welcome-title" id="welcomeTitle">Selamat Datang, %s!</h1>
-            <p class="welcome-subtitle">Dashboard Sistem Informasi Dinas Pendidikan</p>
-        </div>
-        <div class="info-card">
-            <div class="info-header">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: #3b82f6;">
-                    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
-                    <circle cx="12" cy="7" r="4"></circle>
-                </svg>
-                <h2 class="info-title">Informasi User</h2>
-            </div>
-            <div class="info-grid">
-                <div class="info-item">
-                    <label>Nama Lengkap</label>
-                    <div>%s</div>
-                </div>
-                <div class="info-item">
-                    <label>Email</label>
-                    <div>%s</div>
-                </div>
-                <div class="info-item">
-                    <label>NRK</label>
-                    <div>%s</div>
-                </div>
-                <div class="info-item">
-                    <label>Unit Kerja</label>
-                    <div>%s</div>
-                </div>
-                <div class="info-item">
-                    <label>Peran</label>
-                    <div><span class="role-badge %s">%s</span></div>
-                </div>
-                <div class="info-item">
-                    <label>Status</label>
-                    <div><span class="status-badge %s">%s</span></div>
-                </div>
-            </div>
-        </div>
-
-        <div class="info-card">
-             <div class="info-header">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: #3b82f6;">
-                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-                    <polyline points="14 2 14 8 20 8"></polyline>
-                    <line x1="16" y1="13" x2="8" y2="13"></line>
-                    <line x1="16" y1="17" x2="8" y2="17"></line>
-                    <polyline points="10 9 9 9 8 9"></polyline>
-                </svg>
-                <h2 class="info-title">Informasi Data User (Keycloak Payload)</h2>
-            </div>
-            <div class="json-dump">%s</div>
-        </div>
-
-        <div class="actions-grid">
-
-            <a href="/logout" class="action-card" style="background: linear-gradient(135deg, #ef4444 0%%, #dc2626 100%%); color: white;">
-                <div class="action-title">🚪 Logout</div>
-                <div class="action-desc">Keluar dari sistem SSO</div>
-            </a>
-        </div>
-        
-        <div style="margin-top: 24px; padding: 20px; background: #f0fdf4; border-left: 4px solid #22c55e; border-radius: 8px;">
-            <p style="color: #166534; margin: 0; font-size: 14px;">
-                ✅ <strong>Autentikasi SSO Berhasil!</strong> Anda telah login menggunakan Single Sign-On Keycloak.
-            </p>
-        </div>
-    </div>
-
-    <script>
-        // Store SSO user info in sessionStorage for other pages
-        const ssoUserInfo = %s;
-        if (ssoUserInfo && Object.keys(ssoUserInfo).length > 0) {
-            sessionStorage.setItem('sso_user_info', JSON.stringify(ssoUserInfo));
-        }
-
-        // Sync Logout Check (Periodic)
-        function checkSession() {
-            fetch('/auth/validate').then(res => {
-                if (res.status === 401) window.location.reload();
-            }).catch(e => console.error("Session check failed", e));
-        }
-        
-        // Check on load
-        checkSession();
-        
-        // Check every 30 seconds
-        setInterval(checkSession, 30000);
-        
-        // Check on window focus
-        window.addEventListener('focus', checkSession);
-    </script>
-</body>
-</html>`, logoBase64, avatarInitial, userName, userName, userName, userEmail, nrk, unitKerja, roleBadgeClass, userRole, statusBadgeClass, userStatus, jsonPayload, jsonPayload)
+	data := DashboardData{
+		LogoBase64:       logoBase64,
+		AvatarInitial:    avatarInitial,
+		UserName:         userName,
+		UserEmail:        userEmail,
+		NRK:              nrk,
+		UnitKerja:        unitKerja,
+		RoleBadgeClass:   roleBadgeClass,
+		UserRole:         userRole,
+		StatusBadgeClass: statusBadgeClass,
+		UserStatus:       userStatus,
+		JSONPayload:      jsonPayload,
+		WelcomeTitle:     userName,
+	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(html))
+	if err := RenderDashboard(w, data); err != nil {
+		log.Printf("❌ Error rendering dashboard: %v", err)
+	}
 }
 
 
@@ -1202,24 +842,7 @@ func SSOAuthorizeHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, authorizeURLWithParams, http.StatusFound)
 }
 
-// TokenResponse menyimpan response dari token exchange
-type TokenResponse struct {
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
-	ExpiresIn   int    `json:"expires_in"`
-	Scope       string `json:"scope"`
-	IDToken     string `json:"id_token"`
-}
-
-// UserInfo menyimpan informasi user dari SSO
-type UserInfo struct {
-	Sub           string `json:"sub"`
-	Email         string `json:"email"`
-	Name          string `json:"name"`
-	EmailVerified bool   `json:"email_verified"`
-	Peran         string `json:"peran"` // Peran dari SSO (admin, user, dll)
-	Role          string `json:"role"`  // Alternative field name untuk peran
-}
+// (Structs moved to models.go)
 
 // generateState menghasilkan random state untuk CSRF protection
 func generateState() (string, error) {
@@ -1238,180 +861,10 @@ func minInt(a, b int) int {
 	return b
 }
 
-// exchangeCodeForToken menukar authorization code dengan access token
-func exchangeCodeForToken(code string, config SSOConfig) (*TokenResponse, error) {
-	tokenURL := fmt.Sprintf("%s/oauth/token", config.SSOServerURL)
-	log.Printf("📡 Token URL: %s", tokenURL)
-
-	// Prepare form data sesuai requirement
-	formData := url.Values{}
-	formData.Set("grant_type", "authorization_code")
-	formData.Set("code", code)
-	formData.Set("redirect_uri", config.RedirectURI)
-	formData.Set("client_id", config.ClientID)
-
-	// Log request details untuk debugging
-	requestBody := formData.Encode()
-	log.Printf("📤 Request to SSO:")
-	log.Printf("   URL: %s", tokenURL)
-	log.Printf("   Method: POST")
-	log.Printf("   Content-Type: application/x-www-form-urlencoded")
-	log.Printf("   Body: grant_type=authorization_code&code=%s&redirect_uri=%s&client_id=%s",
-		code[:minInt(10, len(code))]+"...", config.RedirectURI, config.ClientID)
-	log.Printf("   Full body length: %d bytes", len(requestBody))
-
-	// Create POST request
-	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(formData.Encode()))
-	if err != nil {
-		return nil, fmt.Errorf("gagal membuat request: %v", err)
-	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	// Execute request
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Printf("❌ Network error: %v", err)
-		return nil, fmt.Errorf("gagal memanggil SSO server: %v", err)
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	log.Printf("📥 Response from SSO:")
-	log.Printf("   Status: %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
-	log.Printf("   Content-Type: %s", resp.Header.Get("Content-Type"))
-	log.Printf("   Body: %s", string(bodyBytes))
-	log.Printf("   Body length: %d bytes", len(bodyBytes))
-
-	if resp.StatusCode != http.StatusOK {
-		// Log error detail untuk debugging
-		log.Printf("❌ Token exchange failed:")
-		log.Printf("   Request URL: %s", tokenURL)
-		log.Printf("   Status: %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
-		log.Printf("   Response Body: %s", string(bodyBytes))
-
-		// Coba parse error response jika ada
-		var errorResp map[string]interface{}
-		if err := json.Unmarshal(bodyBytes, &errorResp); err == nil {
-			if errorMsg, ok := errorResp["error"].(string); ok {
-				errorDesc := ""
-				if desc, ok := errorResp["error_description"].(string); ok {
-					errorDesc = desc
-				} else if desc, ok := errorResp["error_description"].(interface{}); ok {
-					errorDesc = fmt.Sprintf("%v", desc)
-				}
-				return nil, fmt.Errorf("%s: %s", errorMsg, errorDesc)
-			}
-		}
-
-		// Jika response bukan JSON (misalnya 404 dari Vercel), return error dengan body
-		return nil, fmt.Errorf("token exchange gagal: status %d, response: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var tokenResponse TokenResponse
-	if err := json.Unmarshal(bodyBytes, &tokenResponse); err != nil {
-		log.Printf("❌ ERROR parsing token response: %v, Body: %s", err, string(bodyBytes))
-		return nil, fmt.Errorf("gagal parse token response: %v", err)
-	}
-
-	if tokenResponse.AccessToken == "" {
-		return nil, fmt.Errorf("access_token tidak ditemukan di response")
-	}
-
-	return &tokenResponse, nil
-}
+// (Function removed - use ExchangeCodeForToken from keycloak_helpers.go)
 
 // getUserInfoFromSSO mengambil informasi user dari SSO menggunakan access token
-func getUserInfoFromSSO(accessToken string, config SSOConfig) (*UserInfo, error) {
-	userInfoURL := fmt.Sprintf("%s/sso-auth/realms/%s/protocol/openid-connect/userinfo", config.SSOServerURL, config.Realm)
-	// Fallback URL construction if env not set correctly
-	if config.Realm == "" {
-		userInfoURL = fmt.Sprintf("%s/oauth/userinfo", config.SSOServerURL)
-	}
-
-	req, err := http.NewRequest("GET", userInfoURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("gagal membuat request: %v", err)
-	}
-
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("gagal memanggil SSO server: %v", err)
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("ERROR SSO userinfo response: Status %d, Body: %s", resp.StatusCode, string(bodyBytes))
-		return nil, fmt.Errorf("userinfo request gagal: status %d", resp.StatusCode)
-	}
-
-	// Log raw response untuk debugging
-	log.Printf("📥 SSO userinfo raw response: %s", string(bodyBytes))
-
-	var rawResponse map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &rawResponse); err != nil {
-		return nil, fmt.Errorf("gagal parse userinfo response: %v", err)
-	}
-
-	userInfo := &UserInfo{}
-
-	// ---------------------------------------------------------
-	// PARSING DATA STRUCTURE (NEW FORMAT)
-	// ---------------------------------------------------------
-	// Format Baru:
-	// {
-	//   "data": {
-	//     "pengguna": { "nama": "...", "email": "...", "id_pengguna": "..." },
-	//     "jabatan": { "role": "...", "level": "..." },
-	//     "identitas": { "nik": "...", "nip": "..." },
-	//     ...
-	//   },
-	//   "name": "...",
-	//   "email": "...",
-	//   "preferred_username": "..."
-	// }
-	
-	// 1. Coba ambil dari `data` object (Structure Baru)
-	if data, ok := rawResponse["data"].(map[string]interface{}); ok {
-		// Pengguna
-		if pengguna, ok := data["pengguna"].(map[string]interface{}); ok {
-			if val, ok := pengguna["nama"].(string); ok { userInfo.Name = val }
-			if val, ok := pengguna["email"].(string); ok { userInfo.Email = val }
-			// Mapping ID Pengguna?
-		}
-		// Jabatan
-		if jabatan, ok := data["jabatan"].(map[string]interface{}); ok {
-			if val, ok := jabatan["role"].(string); ok { userInfo.Role = val; userInfo.Peran = val }
-		}
-	}
-
-	// 2. Fallback ke standard OIDC fields (jika `data` kosong atau parsial)
-	if userInfo.Name == "" {
-		if val, ok := rawResponse["name"].(string); ok { userInfo.Name = val }
-	}
-	if userInfo.Email == "" {
-		if val, ok := rawResponse["email"].(string); ok { userInfo.Email = val }
-	}
-	if userInfo.Sub == "" {
-		if val, ok := rawResponse["sub"].(string); ok { userInfo.Sub = val }
-	}
-	if userInfo.Role == "" {
-		// Coba ambil dari realm_access.roles atau resource_access
-		// (Implementasi sederhana, sesuaikan jika perlu)
-	}
-
-	// Log hasil parsing
-	log.Printf("📋 User info parsed:")
-	log.Printf("   Name: %s", userInfo.Name)
-	log.Printf("   Email: %s", userInfo.Email)
-	log.Printf("   Role: %s", userInfo.Role)
-
-	return userInfo, nil
-}
+// (Function removed - use ParseIDToken from keycloak_helpers.go)
 
 // handleAuthCheck handles silent SSO check (redirects with prompt=none)
 func handleAuthCheck(w http.ResponseWriter, r *http.Request) {
@@ -1446,14 +899,12 @@ func handleAuthValidate(w http.ResponseWriter, r *http.Request) {
 func findOrCreateUser(userInfo *UserInfo) (interface{}, error) {
 	log.Printf("🔍 findOrCreateUser: searching for user with email: %s", userInfo.Email)
 
-	db, err := connectPostgreSQL()
+	db, err := GetDB()
 	if err != nil {
-		log.Printf("❌ findOrCreateUser: failed to connect to PostgreSQL: %v", err)
-		// Jika tidak bisa connect ke DB, return SSO sub sebagai identifier
-		log.Printf("ℹ️ Using SSO sub as user identifier: %s", userInfo.Sub)
-		return userInfo.Sub, nil
+		return "", fmt.Errorf("failed to connect to PostgreSQL: %v", err)
 	}
-	defer db.Close()
+	// Do NOT close the DB connection here as it is a singleton pool
+	// defer db.Close()
 
 	// Query user from JAKEDU database (account.za_users)
 	query := `
@@ -1488,184 +939,7 @@ func findOrCreateUser(userInfo *UserInfo) (interface{}, error) {
 // 4. Ambil user info dari SSO
 // 5. Buat session user di client
 // 6. Redirect ke dashboard
-func SSOCallbackHandler(w http.ResponseWriter, r *http.Request) {
-	// Log request untuk debugging
-	log.Printf("📥 SSO Callback received:")
-	log.Printf("   Method: %s", r.Method)
-	log.Printf("   URL: %s", r.URL.String())
-	log.Printf("   Host: %s", r.Host)
-	log.Printf("   RemoteAddr: %s", r.RemoteAddr)
-
-	// Parse query parameters
-	code := r.URL.Query().Get("code")
-	state := r.URL.Query().Get("state")
-	errorParam := r.URL.Query().Get("error")
-	errorDescription := r.URL.Query().Get("error_description")
-
-	log.Printf("   Code: %s", func() string {
-		if code != "" {
-			return code[:minInt(10, len(code))] + "..."
-		}
-		return "(empty)"
-	}())
-	log.Printf("   State: %s", func() string {
-		if state != "" {
-			return state[:minInt(10, len(state))] + "..."
-		}
-		return "(empty)"
-	}())
-	log.Printf("   Error: %s", errorParam)
-
-	// Handle error dari SSO
-	if errorParam != "" {
-		log.Printf("ERROR from SSO: %s - %s", errorParam, errorDescription)
-
-		// Jika error adalah login_required (dari silent check), kita harus clear session lokal
-		// supaya user tidak dianggap "sudah login" oleh LoginPageHandler
-		if errorParam == "login_required" || errorParam == "interaction_required" {
-			log.Printf("🔄 Silent SSO failed (login_required), clearing local session and redirecting to login")
-			helpers.ClearCookie(w, r, "client_dinas_session")
-			helpers.ClearCookie(w, r, "sso_access_token")
-			helpers.ClearCookie(w, r, "sso_id_token")
-			helpers.ClearCookie(w, r, "sso_token_expires")
-			helpers.ClearCookie(w, r, "session_id")
-			
-			http.Redirect(w, r, "/login?error=login_required", http.StatusSeeOther)
-			return
-		}
-
-		http.Redirect(w, r, "/login?error=sso_error&message="+url.QueryEscape(errorDescription), http.StatusSeeOther)
-		return
-	}
-
-	// Validasi code
-	if code == "" {
-		log.Println("ERROR: Authorization code tidak ditemukan")
-		http.Redirect(w, r, "/login?error=missing_code", http.StatusSeeOther)
-		return
-	}
-
-	// Validasi state (optional, jika SSO mengirim state)
-	if state != "" {
-		stateCookie, err := helpers.GetCookie(r, "sso_state")
-		if err == nil && stateCookie != "" {
-			if state != stateCookie {
-				log.Printf("ERROR: State mismatch. Expected: %s, Got: %s", stateCookie, state)
-				http.Redirect(w, r, "/login?error=state_mismatch", http.StatusSeeOther)
-				return
-			}
-			// Clear state cookie setelah digunakan
-			helpers.ClearCookie(w, r, "sso_state")
-		}
-	}
-
-	// Exchange code ke access token (tanpa PKCE)
-	config := getSSOConfig()
-	log.Printf("🔄 Exchanging code to token:")
-	log.Printf("   SSO Server URL: %s", config.SSOServerURL)
-	log.Printf("   Redirect URI: %s", config.RedirectURI)
-	log.Printf("   Client ID: %s", config.ClientID)
-	log.Printf("   Code: %s...", code[:minInt(10, len(code))])
-	tokenResponse, err := exchangeCodeForToken(code, config)
-	if err != nil {
-		log.Printf("❌ ERROR exchanging code for token: %v", err)
-		// Redirect dengan error message yang lebih detail
-		errorMsg := url.QueryEscape(fmt.Sprintf("Gagal menukar authorization code: %v", err))
-		http.Redirect(w, r, "/login?error=token_exchange_failed&message="+errorMsg, http.StatusSeeOther)
-		return
-	}
-	log.Printf("✅ Token exchange berhasil: token_type=%s, expires_in=%d", tokenResponse.TokenType, tokenResponse.ExpiresIn)
-
-	// Simpan access token di cookie (untuk digunakan di protected routes)
-	// Token expires dalam expires_in detik (default 3600 = 1 jam)
-	tokenExpiresIn := tokenResponse.ExpiresIn
-	if tokenExpiresIn == 0 {
-		tokenExpiresIn = 3600 // Default 1 jam
-	}
-	helpers.SetCookie(w, r, "sso_access_token", tokenResponse.AccessToken, tokenExpiresIn)
-
-	// Simpan token expires timestamp (current time + expires_in)
-	tokenExpiresAt := time.Now().Unix() + int64(tokenExpiresIn)
-	helpers.SetCookie(w, r, "sso_token_expires", fmt.Sprintf("%d", tokenExpiresAt), tokenExpiresIn)
-
-	// Simpan ID Token (penting untuk logout dan user info display)
-	if tokenResponse.IDToken != "" {
-		helpers.SetCookie(w, r, "sso_id_token", tokenResponse.IDToken, tokenExpiresIn)
-	}
-
-	log.Printf("✅ Token saved: expires in %d seconds", tokenExpiresIn)
-
-	// Ambil user info dari SSO (WAJIB untuk membuat session)
-	userInfo, err := getUserInfoFromSSO(tokenResponse.AccessToken, config)
-	if err != nil {
-		log.Printf("❌ ERROR getting user info: %v", err)
-		log.Printf("⚠️  Cannot create session without user info, redirecting to login")
-		http.Redirect(w, r, "/login?error=userinfo_failed&message="+url.QueryEscape("Gagal mengambil informasi user dari SSO"), http.StatusSeeOther)
-		return
-	}
-
-	// Pastikan email ada
-	if userInfo.Email == "" {
-		log.Printf("❌ ERROR: Email tidak ditemukan di user info")
-		http.Redirect(w, r, "/login?error=missing_email&message="+url.QueryEscape("Email tidak ditemukan"), http.StatusSeeOther)
-		return
-	}
-
-	log.Printf("📋 User info dari SSO:")
-	log.Printf("   Email: %s", userInfo.Email)
-	log.Printf("   Name: %s", userInfo.Name)
-	log.Printf("   Peran: %s", userInfo.Peran)
-
-	// Buat atau update user di database client
-	userID, err := findOrCreateUser(userInfo)
-	if err != nil {
-		log.Printf("❌ ERROR finding/creating user: %v", err)
-		http.Redirect(w, r, "/login?error=user_creation_failed&message="+url.QueryEscape("Gagal membuat user"), http.StatusSeeOther)
-		return
-	}
-
-	log.Printf("✅ User found/created: %v", userID)
-
-	// Buat session di database client (WAJIB)
-	sessionID, err := createSession(userID, r)
-	if err != nil {
-		log.Printf("❌ ERROR creating session: %v", err)
-		http.Redirect(w, r, "/login?error=session_creation_failed&message="+url.QueryEscape("Gagal membuat session"), http.StatusSeeOther)
-		return
-	}
-
-	log.Printf("✅ Session created: %s", sessionID)
-
-	// Set cookie session dengan nama yang berbeda dari SSO server
-	// PENTING: Gunakan cookie name yang berbeda untuk mencegah shared cookie
-	// SSO server menggunakan "sso_admin_session", client website menggunakan "client_dinas_session"
-	helpers.SetCookie(w, r, "client_dinas_session", sessionID, 86400) // 24 jam
-	log.Printf("✅ Cookie 'client_dinas_session' set: %s", sessionID)
-
-	// Set cookie untuk menandakan kapan terakhir kali check ke SSO dilakukan
-	// Ini digunakan untuk mencegah loop redirect ke /sso-check
-	helpers.SetCookie(w, r, "sso_check_time", fmt.Sprintf("%d", time.Now().Unix()), 3600) // Valid 1 jam
-	log.Printf("✅ Cookie 'sso_check_time' set")
-
-	// Log cookie settings untuk debugging
-	log.Printf("🔍 Cookie settings:")
-	log.Printf("   Request Host: %s", r.Host)
-	log.Printf("   Request URL: %s", r.URL.String())
-	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
-		log.Printf("   X-Forwarded-Proto: %s", proto)
-	}
-	if r.TLS != nil {
-		log.Printf("   TLS: true")
-	}
-
-	// Redirect ke dashboard
-	next := r.URL.Query().Get("next")
-	if next == "" {
-		next = "/dashboard"
-	}
-	log.Printf("🔄 Redirecting to: %s", next)
-	http.Redirect(w, r, next, http.StatusSeeOther)
-}
+// (Function removed - use HandleOAuthCallback from keycloak_helpers.go)
 
 // ProfileHandler dan renderProfilePageNew telah dipindahkan ke profile_handler.go
 
@@ -1680,7 +954,7 @@ func LogoutHandler(w http.ResponseWriter, r *http.Request) {
 	sessionID, _ := helpers.GetCookie(r, "client_dinas_session")
 	if sessionID != "" {
 		// Revoke session di database (DELETE dari PostgreSQL)
-		db, err := connectPostgreSQL()
+		db, err := GetDB()
 		if err == nil {
 			_, err = db.Exec("DELETE FROM sesi_login WHERE id_sesi = $1", sessionID)
 			if err != nil {
@@ -1688,7 +962,8 @@ func LogoutHandler(w http.ResponseWriter, r *http.Request) {
 			} else {
 				log.Printf("✅ Session revoked from database: %s", sessionID)
 			}
-			db.Close()
+			// Do NOT close the DB connection here as it is a singleton pool
+			// db.Close()
 		}
 	}
 
@@ -1726,10 +1001,11 @@ func FrontChannelLogoutHandler(w http.ResponseWriter, r *http.Request) {
 	sessionID, _ := helpers.GetCookie(r, "client_dinas_session")
 	if sessionID != "" {
 		// Revoke session dari PostgreSQL
-		db, err := connectPostgreSQL()
+		db, err := GetDB()
 		if err == nil {
 			db.Exec("DELETE FROM sesi_login WHERE id_sesi = $1", sessionID)
-			db.Close()
+			// Do NOT close the DB connection here as it is a singleton pool
+			// db.Close()
 		}
 		log.Printf("✅ Session revoked: %s", sessionID)
 	}
@@ -1760,7 +1036,7 @@ func SSOLoginHandler(w http.ResponseWriter, r *http.Request) {
 // renderLogoutPage menampilkan halaman logout yang akan clear localStorage dan sessionStorage
 // sebelum redirect ke halaman login
 func renderLogoutPage(w http.ResponseWriter) {
-	logoBase64 := base64.StdEncoding.EncodeToString(LogoData)
+	logoBase64 := LogoBase64
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html lang="id">
 <head>
@@ -1869,11 +1145,12 @@ func renderLogoutPage(w http.ResponseWriter) {
 
 // createSessionTableIfNotExists creates the sesi_login table if it doesn't exist
 func createSessionTableIfNotExists() error {
-	db, err := connectPostgreSQL()
+	db, err := GetDB()
 	if err != nil {
 		return fmt.Errorf("failed to connect to PostgreSQL: %v", err)
 	}
-	defer db.Close()
+	// Do NOT close the DB connection here as it is a singleton pool
+	// defer db.Close()
 
 	// Drop existing table if it has foreign key constraints
 	dropTableQuery := `DROP TABLE IF EXISTS sesi_login;`
@@ -1905,11 +1182,12 @@ func createSessionTableIfNotExists() error {
 }
 
 func getUserFromPostgreSQL(identifier string) (map[string]interface{}, error) {
-	db, err := connectPostgreSQL()
+	db, err := GetDB()
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to PostgreSQL: %v", err)
 	}
-	defer db.Close()
+	// Do NOT close the DB connection here as it is a singleton pool
+	// defer db.Close()
 
 	// Query user from PostgreSQL (Schema Baru: account.za_users)
 	// Search by identifier in multiple columns
@@ -2005,12 +1283,13 @@ func createSessionFromIdentifier(r *http.Request, identifier string) (string, bo
 		return "", false
 	}
 	// Connect to PostgreSQL
-	db, err := connectPostgreSQL()
+	db, err := GetDB()
 	if err != nil {
 		log.Printf("ERROR connecting to PostgreSQL: %v", err)
 		return "", false
 	}
-	defer db.Close()
+	// Do NOT close the DB connection here as it is a singleton pool
+	// defer db.Close()
 
 	// Ensure session table exists
 	if err := createSessionTableIfNotExists(); err != nil {
@@ -2162,13 +1441,14 @@ func handleSSOUserLoginAPI(w http.ResponseWriter, r *http.Request) {
 	// Check if user exists by email in PostgreSQL (JAKEDU)
 	log.Printf("🔍 Checking JAKEDU database for user: %s", req.Email)
 	
-	db, err := connectPostgreSQL()
+	db, err := GetDB()
 	if err != nil {
 		log.Printf("❌ Failed to connect to PostgreSQL: %v", err)
 		helpers.WriteError(w, http.StatusInternalServerError, "Database connection error")
 		return
 	}
-	defer db.Close()
+	// Do NOT close the DB connection here as it is a singleton pool
+	// defer db.Close()
 
 	query := `
 		SELECT id, email, fullname, role_id 
@@ -2247,13 +1527,14 @@ func handleSSOAuthLoginAPI(w http.ResponseWriter, r *http.Request) {
 	// Get user by email from PostgreSQL (JAKEDU)
 	log.Printf("🔍 Checking JAKEDU database for user: %s", req.Email)
 	
-	db, err := connectPostgreSQL()
+	db, err := GetDB()
 	if err != nil {
 		log.Printf("❌ Failed to connect to PostgreSQL: %v", err)
 		helpers.WriteError(w, http.StatusInternalServerError, "Database connection error")
 		return
 	}
-	defer db.Close()
+	// Do NOT close the DB connection here as it is a singleton pool
+	// defer db.Close()
 
 	query := `
 		SELECT id, email, fullname 
@@ -2333,12 +1614,13 @@ func validateSession(sessionID string) (userID string, ok bool, err error) {
 	log.Printf("🔍 validateSession: checking session ID: %s", sessionID)
 
 	// Connect to PostgreSQL
-	db, err := connectPostgreSQL()
+	db, err := GetDB()
 	if err != nil {
 		log.Printf("❌ validateSession: failed to connect to PostgreSQL: %v", err)
 		return "", false, fmt.Errorf("failed to connect to PostgreSQL: %v", err)
 	}
-	defer db.Close()
+	// Do NOT close the DB connection here as it is a singleton pool
+	// defer db.Close()
 
 	// Query session from PostgreSQL
 	var userIDResult string
@@ -2371,11 +1653,12 @@ func clearSession(sessionID string) error {
 	}
 
 	// Connect to PostgreSQL
-	db, err := connectPostgreSQL()
+	db, err := GetDB()
 	if err != nil {
 		return fmt.Errorf("failed to connect to PostgreSQL: %v", err)
 	}
-	defer db.Close()
+	// Do NOT close the DB connection here as it is a singleton pool
+	// defer db.Close()
 
 	// Delete session from PostgreSQL
 	query := `DELETE FROM sesi_login WHERE id_sesi = $1`
@@ -2397,11 +1680,12 @@ func createSession(userID interface{}, r *http.Request) (sessionID string, err e
 	}
 
 	// Connect to PostgreSQL
-	db, err := connectPostgreSQL()
+	db, err := GetDB()
 	if err != nil {
 		return "", fmt.Errorf("failed to connect to PostgreSQL: %v", err)
 	}
-	defer db.Close()
+	// Do NOT close the DB connection here as it is a singleton pool
+	// defer db.Close()
 
 	// Ensure session table exists
 	err = createSessionTableIfNotExists()
@@ -2430,7 +1714,7 @@ func createSession(userID interface{}, r *http.Request) (sessionID string, err e
 
 // Page rendering functions
 func renderLoginPage(w http.ResponseWriter, errorMsg string) {
-	logoBase64 := base64.StdEncoding.EncodeToString(LogoData)
+	logoBase64 := LogoBase64
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html lang="id">
 <head>

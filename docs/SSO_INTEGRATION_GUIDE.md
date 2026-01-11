@@ -49,12 +49,11 @@ KEYCLOAK_REDIRECT_URI=http://localhost:YOUR_PORT/callback
 
 **Go:**
 ```go
-// Login
-http.Redirect(w, r, getKeycloakAuthURL(), http.StatusFound)
+// Login (Mengarahkan ke Keycloak)
+RedirectToKeycloakLogin(w, r, false)
 
-// Callback
-token := exchangeCode(r.URL.Query().Get("code"))
-userInfo := parseIDToken(token.IDToken)
+// Callback (Memproses hasil login)
+HandleOAuthCallback(w, r)
 ```
 
 ---
@@ -148,8 +147,23 @@ KEYCLOAK_CLIENT_SECRET=your-secret
 
 Cara termudah untuk implementasi di project Go lain adalah dengan meng-copy file `api/keycloak_helpers.go` dari repository ini.
 
-### Langkah 1: Copy Helper
-Copy file `api/keycloak_helpers.go` ke folder project Anda (misal ke folder `pkg/sso/`).
+### Langkah 1: Copy Helper & Models
+Copy file berikut ke project Anda:
+1. `api/keycloak_helpers.go` -> Logic utama SSO.
+2. `api/models.go` -> Definisi struct `TokenResponse` dan `UserInfo`.
+3. `api/db.go` (Optional) -> Jika butuh koneksi database dengan pooling.
+4. `api/templates.go` (Optional) -> Jika ingin menggunakan sistem template HTML yang aman.
+
+#### 📂 Struktur Folder & Fungsi File
+Berikut adalah penjelasan fungsi dari setiap file di folder `api/` yang kami sediakan:
+
+| Nama File | Fungsi Utama | Mengapa Penting? |
+|-----------|--------------|------------------|
+| `db.go` | Singleton DB Connection Pool | Mencegah kebocoran koneksi dan meningkatkan performa database. |
+| `keycloak_helpers.go` | Core SSO Logic & PKCE | Menangani seluruh alur OAuth2/OIDC secara otomatis dan aman. |
+| `main_handler.go` | HTTP Routing & Handlers | Menjadi sangat bersih karena logic berat sudah dipindahkan ke helper. |
+| `models.go` | Centralized Data Structures | Satu tempat untuk semua definisi data, mencegah duplikasi struct. |
+| `templates.go` | Secure HTML Rendering | Menggunakan `html/template` untuk mencegah serangan XSS. |
 
 ### Langkah 2: Konfigurasi Environment
 Pastikan environment variables berikut sudah di-set (Gunakan IP Staging):
@@ -159,6 +173,13 @@ KEYCLOAK_BASE_URL=http://10.40.69.51:8080
 KEYCLOAK_REALM=dinas-pendidikan
 KEYCLOAK_CLIENT_ID=your-client-id
 KEYCLOAK_REDIRECT_URI=http://localhost:8070/callback
+
+# Database JAKEDU (Optional)
+JAKEDU_PG_HOST=localhost
+JAKEDU_PG_PORT=5432
+JAKEDU_PG_DB=dinas_pendidikan
+JAKEDU_PG_USER=postgres
+JAKEDU_PG_PASSWORD=postgres
 ```
 
 ### Langkah 3: Gunakan di Handler Anda
@@ -191,18 +212,37 @@ func CallbackHandler(w http.ResponseWriter, r *http.Request) {
 ```
 
 **3. Handler Logout (Keluar dari Sistem)**
-Gunakan fungsi `redirectToKeycloakLogout`. Fungsi ini akan menghapus session di website Anda dan juga memberitahu Keycloak bahwa user sudah keluar.
+Gunakan fungsi `GetLogoutURL` untuk mendapatkan URL logout Keycloak, lalu redirect user ke sana.
 
 ```go
 func LogoutHandler(w http.ResponseWriter, r *http.Request) {
-    // Ambil ID Token dari cookie (disimpan otomatis oleh helper saat login)
+    // 1. Ambil ID Token dari cookie (disimpan otomatis oleh helper saat login)
     idToken, _ := helpers.GetCookie(r, "sso_id_token")
     
-    // URL tujuan setelah logout berhasil
-    redirectURI := "http://localhost:8070/login"
+    // 2. Hapus session lokal
+    helpers.ClearCookie(w, r, "client_dinas_session")
+    helpers.ClearCookie(w, r, "sso_access_token")
+    helpers.ClearCookie(w, r, "sso_id_token")
     
-    // Panggil helper untuk proses logout ke Keycloak
-    redirectToKeycloakLogout(w, r, idToken, redirectURI)
+    // 3. Dapatkan URL logout Keycloak
+    redirectURI := "http://localhost:8070/login"
+    logoutURL := GetLogoutURL(idToken, redirectURI)
+    
+    // 4. Redirect ke Keycloak
+    http.Redirect(w, r, logoutURL, http.StatusSeeOther)
+}
+```
+
+**4. Database Integration (Pooling & Singleton)**
+Gunakan `GetDB()` dari `api/db.go` untuk mendapatkan koneksi database yang efisien.
+
+```go
+func GetUserData(email string) {
+    db, err := GetDB()
+    if err != nil {
+        log.Fatal(err)
+    }
+    // Gunakan db... (Jangan di-close manual karena ini singleton pool)
 }
 ```
 
@@ -212,9 +252,10 @@ func LogoutHandler(w http.ResponseWriter, r *http.Request) {
 |-------------|----------|------------------|
 | `RedirectToKeycloakLogin` | Memulai proses login | Saat user klik tombol "Login" |
 | `HandleOAuthCallback` | Memproses data setelah user login | Di endpoint `/callback` |
-| `redirectToKeycloakLogout` | Keluar dari akun | Saat user klik tombol "Logout" |
-| `ParseIDToken` | Mengambil data user (Nama, Email) | Jika Anda ingin baca data user dari token secara manual |
-| `ValidateAccessToken` | Cek apakah login masih aktif | Untuk proteksi halaman (Middleware) |
+| `GetLogoutURL` | Mendapatkan URL logout Keycloak | Saat user klik tombol "Logout" |
+| `ParseIDToken` | Mengambil data user dari JWT | Untuk mendapatkan info user tanpa hit API lagi |
+| `GetDB` | Mendapatkan koneksi DB pool | Setiap kali butuh akses database |
+| `RenderDashboard` | Render HTML secara aman | Untuk menampilkan halaman dashboard |
 
 ### Penting: Menangani Infinite Loop (Silent Check)
 
@@ -225,6 +266,21 @@ Jika menerima error `login_required`, **HAPUS** semua session lokal dan redirect
 
 **Di Login Page Handler:**
 Jika URL mengandung `error=login_required`, **HAPUS** semua session lokal dan jangan redirect otomatis ke dashboard.
+
+---
+
+## 📊 Analisis Optimasi: Sebelum vs Sesudah
+
+Project ini telah dioptimasi agar layak menjadi standar percontohan (Gold Standard) bagi developer lain. Berikut adalah perbandingannya:
+
+| Aspek | Sebelum Optimasi (Legacy) | Sesudah Optimasi (Modern) |
+|-------|---------------------------|---------------------------|
+| **Arsitektur** | Logic SSO tersebar di `main_handler.go`, banyak kode duplikat. | Logic terpusat di `keycloak_helpers.go`, kode modular dan bersih. |
+| **Database** | Buka-tutup koneksi di setiap query (`connectPostgreSQL`). | Menggunakan **Singleton Connection Pool** (`GetDB`). Jauh lebih stabil. |
+| **Keamanan** | HTML dibuat manual dengan `fmt.Sprintf` (Rentan XSS). | Menggunakan **Go Templates** yang otomatis melakukan sanitasi data. |
+| **Performa** | Aset (Logo) di-encode Base64 setiap kali request masuk. | Aset di-encode sekali saat startup (`init`) dan disimpan di memori. |
+| **Maintainability** | File handler sangat panjang (>2000 baris) dan sulit di-debug. | Kode terbagi rapi berdasarkan fungsinya (Models, Helpers, DB). |
+| **Token Handling** | Parsing JWT manual atau unverified. | Menggunakan library standar `jwt-go` dengan verifikasi yang tepat. |
 
 ---
 
@@ -667,13 +723,16 @@ if (window.location.pathname === '/callback') {
 
 Jika website Anda membutuhkan data tambahan dari database JAKEDU (seperti NRK, Unit Kerja, dll), Anda dapat menggunakan koneksi PostgreSQL langsung.
 
-### 1. Environment Variables
-```bash
-JAKEDU_PG_HOST=10.40.69.20
-JAKEDU_PG_PORT=5434
-JAKEDU_PG_DB=jakedu_dwh
-JAKEDU_PG_USER=your_user
-JAKEDU_PG_PASSWORD=your_password
+### 1. Gunakan Database Pooling
+Jangan membuka koneksi database baru di setiap request. Gunakan singleton pattern dengan pooling seperti di `api/db.go`.
+
+```go
+// Contoh penggunaan GetDB() yang efisien
+db, err := GetDB()
+if err != nil {
+    return err
+}
+// Query...
 ```
 
 ### 2. Query User by Email/SSO Sub
@@ -685,6 +744,27 @@ FROM account.za_users
 WHERE email = $1 OR nickname = $1
 LIMIT 1;
 ```
+
+---
+
+## 🚀 Best Practices: Aman & Cepat
+
+Agar project Anda memiliki kualitas production-ready (seperti project ini), ikuti tips berikut:
+
+### 1. Keamanan (Security)
+*   **XSS Protection**: Gunakan `html/template` (Go) daripada `fmt.Sprintf` untuk merender HTML. Ini otomatis melakukan escaping pada data user.
+*   **CSRF Protection**: Selalu gunakan parameter `state` saat redirect ke Keycloak dan validasi saat callback.
+*   **PKCE**: Wajib gunakan PKCE (`code_challenge` & `code_verifier`) untuk mencegah interception.
+*   **JWT Verification**: Untuk keamanan maksimal, verifikasi signature ID Token menggunakan Public Key dari Keycloak (JWKS).
+
+### 2. Kecepatan (Performance)
+*   **DB Pooling**: Batasi jumlah koneksi ke database (misal: `SetMaxOpenConns(5)`) agar tidak menghabiskan resource server saat traffic tinggi.
+*   **Asset Pre-calculation**: Jika ada aset statis yang perlu di-encode (seperti Logo Base64), lakukan di fungsi `init()` agar hanya dihitung sekali saat aplikasi start.
+*   **Silent SSO**: Gunakan `prompt=none` untuk mengecek status login user di background tanpa mengganggu UX (tidak ada kedipan redirect jika user sudah login).
+
+### 3. Reliability
+*   **Singleton Pattern**: Gunakan singleton untuk objek berat seperti koneksi database dan parser template.
+*   **Graceful Error Handling**: Jangan tampilkan error teknis (seperti SQL error) ke user. Redirect ke halaman login dengan pesan yang user-friendly.
 
 ---
 
